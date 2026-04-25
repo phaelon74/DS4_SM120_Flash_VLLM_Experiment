@@ -1,0 +1,150 @@
+services:
+  vllm:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm-nightly-sm120
+    image: vllm-deepseekv4-sm120-deepgemm:latest
+    container_name: vllm-deepseekv4-sm120-deepgemm
+    entrypoint: /bin/bash
+    command:
+      - -lc
+      - |
+        set -euo pipefail
+        cd /workspace/DeepGEMM
+        DG_FORCE_BUILD=0 CUDA_HOME=/usr/local/cuda python3 -m pip install -e . --no-build-isolation
+        python3 docker/patch_vllm_deepseekv4.py
+        export VLLM_USE_DEEP_GEMM=1
+        export VLLM_USE_DEEP_GEMM_E8M0=1
+        export VLLM_ENGINE_READY_TIMEOUT_S=3600
+        export VLLM_RPC_TIMEOUT=600000
+        export TILELANG_CLEANUP_TEMP_FILES=1
+        export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+        export DG_SM120_SKIP_PADDED_ZERO=1
+        export DG_SM120_FP4_COLS_PER_BLOCK=8
+        export DG_SM120_FULL_CONTEXT_BF16_BMM=1
+        export DG_SM120_INDEXED_BF16_BMM=1
+        export DG_SM120_WORKSPACE_FUSED_ATTENTION=1
+        export DG_SM120_WORKSPACE_SPLIT_ATTENTION="${DG_SM120_WORKSPACE_SPLIT_ATTENTION:-1}"
+        export DG_SM120_ENABLE_FP8_M1_KBLOCK="${DG_SM120_ENABLE_FP8_M1_KBLOCK:-1}"
+        export DG_SM120_MOE_SKIP_SFA_FILL="${DG_SM120_MOE_SKIP_SFA_FILL:-1}"
+        export DG_SM120_ENABLE_SMALL_M_MMA=0
+        export DG_SM120_MAIN_TOPK_CAP=128
+        export DG_SM120_ACTIVE_HEADS=32
+        export DG_SM120_SEQUENTIAL_COMPRESSOR="${DG_SM120_SEQUENTIAL_COMPRESSOR:-1}"
+        export DG_SM120_FLASHMLA_PREFILL_WORKSPACE_FACTOR="${DG_SM120_FLASHMLA_PREFILL_WORKSPACE_FACTOR:-1}"
+        export DG_SM120_ENABLE_B12X_MOE="${DG_SM120_ENABLE_B12X_MOE:-0}"
+        export DG_SM120_B12X_A1_GS="${DG_SM120_B12X_A1_GS:-1.0}"
+        export DG_SM120_B12X_A2_GS="${DG_SM120_B12X_A2_GS:-1.0}"
+        export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
+        export B12X_CUTE_COMPILE_CACHE_DIR="${B12X_CUTE_COMPILE_CACHE_DIR:-/tmp/b12x_cute_cache}"
+        export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-131072}"
+        export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}"
+        export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-4}"
+        export VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE="${VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE:-4}"
+        export VLLM_PERFORMANCE_MODE="${VLLM_PERFORMANCE_MODE:-balanced}"
+        export VLLM_OPTIMIZATION_LEVEL="${VLLM_OPTIMIZATION_LEVEL:-2}"
+        export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.980}"
+        export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
+        export VLLM_KV_CACHE_MEMORY_BYTES="${VLLM_KV_CACHE_MEMORY_BYTES:-8589934592}"
+        export VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
+        set --
+        case "$(printenv VLLM_ENFORCE_EAGER)" in
+          1|true|TRUE|yes|YES|on|ON)
+            set -- "$@" --enforce-eager
+            ;;
+        esac
+        if [[ -n "$(printenv VLLM_KV_CACHE_MEMORY_BYTES)" ]]; then
+          set -- "$@" --kv-cache-memory-bytes "$(printenv VLLM_KV_CACHE_MEMORY_BYTES)"
+        fi
+        export DG_SM120_INSTALL_PROFILE_PATCH="${DG_SM120_INSTALL_PROFILE_PATCH:-0}"
+        export DG_SM120_PROFILE_LAYER="${DG_SM120_PROFILE_LAYER:-0}"
+        export DG_SM120_PROFILE_EVERY="${DG_SM120_PROFILE_EVERY:-2048}"
+        export DG_SM120_KERNEL_PROFILE="${DG_SM120_KERNEL_PROFILE:-0}"
+        export DG_SM120_KERNEL_PROFILE_EVERY="${DG_SM120_KERNEL_PROFILE_EVERY:-256}"
+        export DG_SM120_KERNEL_PROFILE_PATH="${DG_SM120_KERNEL_PROFILE_PATH:-/tmp/dg_sm120_kernel_profile.tsv}"
+        export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+        exec vllm serve deepseek-ai/DeepSeek-V4-Flash \
+          --trust-remote-code \
+          --attention-backend FLASHMLA_SPARSE \
+          --moe-backend deep_gemm \
+          --kv-cache-dtype fp8_ds_mla \
+          --block-size 256 \
+          --enable-expert-parallel \
+          -tp 2 \
+          --tokenizer-mode deepseek_v4 \
+          --tool-call-parser deepseek_v4 \
+          --enable-auto-tool-choice \
+          --reasoning-parser deepseek_v4 \
+          --max-model-len "$(printenv VLLM_MAX_MODEL_LEN)" \
+          --max-num-batched-tokens "$(printenv VLLM_MAX_NUM_BATCHED_TOKENS)" \
+          --max-num-seqs "$(printenv VLLM_MAX_NUM_SEQS)" \
+          --max-num-partial-prefills 1 \
+          --max-long-partial-prefills 1 \
+          --enable-chunked-prefill \
+          --optimization-level "$(printenv VLLM_OPTIMIZATION_LEVEL)" \
+          --performance-mode "$(printenv VLLM_PERFORMANCE_MODE)" \
+          --max-cudagraph-capture-size "$(printenv VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE)" \
+          --gpu-memory-utilization "$(printenv VLLM_GPU_MEMORY_UTILIZATION)" \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --disable-uvicorn-access-log \
+          $(printenv VLLM_EXTRA_ARGS) \
+          "$@"
+    ipc: host
+    shm_size: 32gb
+    init: true
+    ports:
+      - "8080:8000"
+    environment:
+      CUDA_VISIBLE_DEVICES: "0,1"
+      CUDA_HOME: /usr/local/cuda
+      TORCH_CUDA_ARCH_LIST: "12.0"
+      TORCH_ALLOW_TF32_CUBLAS_OVERRIDE: "1"
+      VLLM_TARGET_DEVICE: cuda
+      VLLM_USE_DEEP_GEMM_E8M0: "1"
+      VLLM_ALLREDUCE_USE_SYMM_MEM: "0"
+      DG_SM120_FULL_CONTEXT_BF16_BMM: "1"
+      DG_SM120_INDEXED_BF16_BMM: "1"
+      DG_SM120_WORKSPACE_FUSED_ATTENTION: "1"
+      DG_SM120_WORKSPACE_SPLIT_ATTENTION: "${DG_SM120_WORKSPACE_SPLIT_ATTENTION:-1}"
+      DG_SM120_ENABLE_FP8_M1_KBLOCK: "${DG_SM120_ENABLE_FP8_M1_KBLOCK:-1}"
+      DG_SM120_MOE_SKIP_SFA_FILL: "${DG_SM120_MOE_SKIP_SFA_FILL:-1}"
+      DG_SM120_ENABLE_SMALL_M_MMA: "0"
+      DG_SM120_MAIN_TOPK_CAP: "128"
+      DG_SM120_ACTIVE_HEADS: "32"
+      DG_SM120_SEQUENTIAL_COMPRESSOR: "${DG_SM120_SEQUENTIAL_COMPRESSOR:-1}"
+      DG_SM120_FLASHMLA_PREFILL_WORKSPACE_FACTOR: "${DG_SM120_FLASHMLA_PREFILL_WORKSPACE_FACTOR:-1}"
+      DG_SM120_ENABLE_B12X_MOE: "${DG_SM120_ENABLE_B12X_MOE:-0}"
+      DG_SM120_B12X_A1_GS: "${DG_SM120_B12X_A1_GS:-1.0}"
+      DG_SM120_B12X_A2_GS: "${DG_SM120_B12X_A2_GS:-1.0}"
+      CUTE_DSL_ARCH: "${CUTE_DSL_ARCH:-sm_120a}"
+      B12X_CUTE_COMPILE_CACHE_DIR: "${B12X_CUTE_COMPILE_CACHE_DIR:-/tmp/b12x_cute_cache}"
+      VLLM_MAX_MODEL_LEN: "${VLLM_MAX_MODEL_LEN:-131072}"
+      VLLM_MAX_NUM_BATCHED_TOKENS: "${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}"
+      VLLM_MAX_NUM_SEQS: "${VLLM_MAX_NUM_SEQS:-4}"
+      VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE: "${VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE:-4}"
+      VLLM_PERFORMANCE_MODE: "${VLLM_PERFORMANCE_MODE:-balanced}"
+      VLLM_OPTIMIZATION_LEVEL: "${VLLM_OPTIMIZATION_LEVEL:-2}"
+      VLLM_GPU_MEMORY_UTILIZATION: "${VLLM_GPU_MEMORY_UTILIZATION:-0.980}"
+      VLLM_ENFORCE_EAGER: "${VLLM_ENFORCE_EAGER:-0}"
+      VLLM_KV_CACHE_MEMORY_BYTES: "${VLLM_KV_CACHE_MEMORY_BYTES:-8589934592}"
+      VLLM_EXTRA_ARGS: "${VLLM_EXTRA_ARGS:-}"
+      DG_SM120_INSTALL_PROFILE_PATCH: "0"
+      DG_SM120_PROFILE_LAYER: "0"
+      DG_SM120_PROFILE_EVERY: "2048"
+      DG_SM120_KERNEL_PROFILE: "${DG_SM120_KERNEL_PROFILE:-0}"
+      DG_SM120_KERNEL_PROFILE_EVERY: "${DG_SM120_KERNEL_PROFILE_EVERY:-256}"
+      DG_SM120_KERNEL_PROFILE_PATH: "${DG_SM120_KERNEL_PROFILE_PATH:-/tmp/dg_sm120_kernel_profile.tsv}"
+      MAX_JOBS: "16"
+    volumes:
+      - .:/workspace/DeepGEMM
+      - ./vllm_src:/workspace/vllm
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${HOME}/.cache/pip:/root/.cache/pip
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "2"]
+              capabilities: [gpu]

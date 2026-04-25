@@ -36,6 +36,17 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
+    // SM120 has no SM100 TMEM path. Keep C128/C32 scales as FP32 in their
+    // logical layout and let the SM120 fallback consume them directly.
+    if (sf.scalar_type() == torch::kFloat and arch_major == 12 and (gran_k == 32 or gran_k == 128))
+        return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, false, torch::kFloat);
+
+    // SM120 dense FP8 can receive packed UE8M0 activation scales from vLLM.
+    // Keep the logical packed layout and let the SM120 implementation decode it.
+    if (sf.scalar_type() == torch::kInt and arch_major == 12 and gran_mn == 1 and
+        (gran_k == 32 or gran_k == 128))
+        return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, false, torch::kInt);
+
     // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
     if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
         return get_mn_major_tma_aligned_tensor(sf);

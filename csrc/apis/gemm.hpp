@@ -8,6 +8,9 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_fp8_gemm_fallback.hpp"
+#include "../jit_kernels/impls/sm120_fp8_fp8_cutlass.hpp"
+#include "../jit_kernels/impls/sm120_fp8_fp4_cutlass.hpp"
 #endif 
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
@@ -82,6 +85,8 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     // Transform SFA and SFB into compute-required layout
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
         a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+    const int gran_mn_a = recipe.has_value() ? std::get<0>(recipe.value()) : std::get<0>(recipe_a.value());
+    const int gran_mn_b = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
 
     // Dispatch into different implements
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
@@ -95,6 +100,18 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims);
+    } else if (arch_major == 12 and a.first.scalar_type() == torch::kFloat8_e4m3fn and
+               b.first.scalar_type() == torch::kFloat8_e4m3fn and
+               (sfa.scalar_type() == torch::kFloat or sfa.scalar_type() == torch::kInt) and
+               (sfb.scalar_type() == torch::kFloat or sfb.scalar_type() == torch::kInt)) {
+        if (sm120_fp8_fp8_gemm_nt_cutlass(
+                a.first, sfa, b.first, sfb, d, m, n, k, gran_mn_a, gran_k_a,
+                gran_mn_b, gran_k_b, major_a, major_b, c.has_value())) {
+            return;
+        }
+        sm120_fp8_gemm_nt_fallback(a.first, sfa, b.first, sfb, c, d, m, n, k,
+                                   gran_mn_a, gran_k_a, gran_mn_b, gran_k_b,
+                                   major_a, major_b);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -187,8 +204,22 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         return;
 
     // Transform SFA and SFB into compute-required layout
-    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
+    int gran_k_a = 0;
+    int gran_k_b = 0;
+    torch::Tensor sfa;
+    torch::Tensor sfb;
+    const bool sm120_fp4 = arch_major == 12 &&
+        a.first.scalar_type() == torch::kFloat8_e4m3fn &&
+        b.first.scalar_type() == kPackedFP4;
+    if (sm120_fp4 && recipe_a.has_value() && recipe_b.has_value()) {
+        sfa = a.second;
+        sfb = b.second;
+        gran_k_a = std::get<1>(recipe_a.value());
+        gran_k_b = std::get<1>(recipe_b.value());
+    } else {
+        std::tie(sfa, sfb, gran_k_a, gran_k_b) = layout::transform_sf_pair_into_required_layout(
+            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
+    }
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
@@ -200,9 +231,108 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+    } else if (arch_major == 12 and a.first.scalar_type() == torch::kFloat8_e4m3fn and
+               b.first.scalar_type() == kPackedFP4) {
+        if (sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass(
+                a.first, sfa, b.first, sfb, d, grouped_layout, num_groups, m, n, k,
+                gran_k_a, gran_k_b, major_b, use_psum_layout)) {
+            return;
+        }
+        if (sfa.scalar_type() == torch::kFloat && sfb.scalar_type() == torch::kFloat) {
+            sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_fallback(
+                a.first, sfa, b.first, sfb, d, grouped_layout, num_groups, m, n, k,
+                gran_k_a, gran_k_b, major_b, use_psum_layout);
+        } else {
+            DG_HOST_UNREACHABLE("SM120 packed-scale FP4 GEMM requires the Cutlass path");
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
+}
+
+static void m_grouped_fp8_fp4_gemm_nt_contiguous_with_starts(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                             const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                             const torch::Tensor& d,
+                                                             const torch::Tensor& grouped_layout,
+                                                             const torch::Tensor& expert_starts,
+                                                             const torch::Tensor& expert_counts,
+                                                             std::optional<std::tuple<int, int, int>> recipe,
+                                                             std::optional<std::tuple<int, int>> recipe_a,
+                                                             std::optional<std::tuple<int, int>> recipe_b,
+                                                             const std::string& compiled_dims,
+                                                             const bool& disable_ue8m0_cast,
+                                                             const bool& use_psum_layout,
+                                                             const std::optional<int>& expected_m_for_psum_layout) {
+    const auto major_a = get_major_type_ab(a.first);
+    const auto major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    if (fp8_requires_k_major())
+        DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(grouped_layout.is_contiguous());
+    DG_HOST_ASSERT(expert_starts.is_contiguous());
+    DG_HOST_ASSERT(expert_counts.is_contiguous());
+
+    const auto arch_major = device_runtime->get_arch_major();
+    if (arch_major != 12) {
+        m_grouped_fp8_fp4_gemm_nt_contiguous(
+            a, b, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims,
+            disable_ue8m0_cast, use_psum_layout, expected_m_for_psum_layout);
+        return;
+    }
+
+    const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
+    const auto [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(expert_starts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(expert_counts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(expert_starts.numel() == num_groups);
+    DG_HOST_ASSERT(expert_counts.numel() == num_groups);
+
+    if (use_psum_layout) {
+        const auto [num_groups_] = get_shape<1>(grouped_layout);
+        DG_HOST_ASSERT(num_groups == num_groups_);
+    } else {
+        const auto [m__] = get_shape<1>(grouped_layout);
+        DG_HOST_ASSERT(m == m__);
+        DG_HOST_ASSERT(not expected_m_for_psum_layout.has_value());
+    }
+
+    check_major_type_cd(d);
+    if (m == 0)
+        return;
+
+    int gran_k_a = 0;
+    int gran_k_b = 0;
+    torch::Tensor sfa;
+    torch::Tensor sfb;
+    if (a.first.scalar_type() == torch::kFloat8_e4m3fn &&
+        b.first.scalar_type() == kPackedFP4 &&
+        recipe_a.has_value() && recipe_b.has_value()) {
+        sfa = a.second;
+        sfb = b.second;
+        gran_k_a = std::get<1>(recipe_a.value());
+        gran_k_b = std::get<1>(recipe_b.value());
+    } else {
+        std::tie(sfa, sfb, gran_k_a, gran_k_b) = layout::transform_sf_pair_into_required_layout(
+            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
+    }
+
+    if (a.first.scalar_type() == torch::kFloat8_e4m3fn &&
+        b.first.scalar_type() == kPackedFP4) {
+        if (sm120_m_grouped_fp8_fp4_gemm_nt_contiguous_cutlass_with_starts(
+                a.first, sfa, b.first, sfb, d, grouped_layout, expert_starts, expert_counts,
+                num_groups, m, n, k, gran_k_a, gran_k_b, major_b, use_psum_layout)) {
+            return;
+        }
+    }
+
+    m_grouped_fp8_fp4_gemm_nt_contiguous(
+        a, b, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims,
+        disable_ue8m0_cast, use_psum_layout, expected_m_for_psum_layout);
 }
 
 static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -632,6 +762,19 @@ static void register_apis(pybind11::module_& m) {
           py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false,
           py::arg("expected_m_for_psum_layout") = std::nullopt);
+    m.def("m_grouped_fp8_fp4_gemm_nt_contiguous_with_starts", &m_grouped_fp8_fp4_gemm_nt_contiguous_with_starts,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
+          py::arg("expert_starts"), py::arg("expert_counts"),
+          py::arg("recipe") = std::nullopt,
+          py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
+          py::arg("compiled_dims") = "nk",
+          py::arg("disable_ue8m0_cast") = false,
+          py::arg("use_psum_layout") = false,
+          py::arg("expected_m_for_psum_layout") = std::nullopt);
+    m.def("sm120_prepack_fp8_fp4_sfb", &sm120_prepack_fp8_fp4_sfb,
+          py::arg("sfb"), py::arg("layout_m"), py::arg("n"), py::arg("k"));
+    m.def("sm120_fp8_fp4_sfb_layout_numel", &sm120_fp8_fp4_sfb_layout_numel,
+          py::arg("layout_m"), py::arg("n"), py::arg("k"));
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
@@ -654,6 +797,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("ks_tensor"), py::arg("c") = std::nullopt,
           py::arg("recipe") = std::make_tuple(1, 1, 128),
           py::arg("compiled_dims") = "mn");
+    m.def("sm120_fp8_bhr_hdr_bhd", &sm120_fp8_bhr_hdr_bhd,
+          py::arg("a"), py::arg("a_scale"), py::arg("b"),
+          py::arg("b_scale"), py::arg("out"));
 
     // FP8 GEMM alias names
     m.attr("fp8_gemm_nt") = m.attr("fp8_fp4_gemm_nt");
@@ -661,6 +807,7 @@ static void register_apis(pybind11::module_& m) {
     m.attr("fp8_gemm_tn") = m.attr("fp8_fp4_gemm_tn");
     m.attr("fp8_gemm_tt") = m.attr("fp8_fp4_gemm_tt");
     m.attr("m_grouped_fp8_gemm_nt_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nt_contiguous");
+    m.attr("m_grouped_fp8_gemm_nt_contiguous_with_starts") = m.attr("m_grouped_fp8_fp4_gemm_nt_contiguous_with_starts");
     m.attr("m_grouped_fp8_gemm_nn_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nn_contiguous");
     m.attr("m_grouped_fp8_gemm_nt_masked") = m.attr("m_grouped_fp8_fp4_gemm_nt_masked");
 #endif

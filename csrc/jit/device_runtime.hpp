@@ -93,6 +93,11 @@ public:
                 return "100";
             return support_arch_family ? "100f" : "100a";
         }
+        if (major == 12) {
+            if (number_only)
+                return "120";
+            return support_arch_family ? "120f" : "120";
+        }
         return std::to_string(major * 10 + minor) + (number_only ? "" : "a");
     }
 

@@ -38,6 +38,7 @@ try:
         fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
         fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
         m_grouped_fp8_fp4_gemm_nt_contiguous,
+        m_grouped_fp8_fp4_gemm_nt_contiguous_with_starts,
         m_grouped_fp8_fp4_gemm_nn_contiguous,
         m_grouped_fp8_fp4_gemm_nt_masked,
         # FP8 GEMMs
@@ -45,6 +46,7 @@ try:
         fp8_gemm_tn, fp8_gemm_tt,
         fp8_gemm_nt_skip_head_mid,
         m_grouped_fp8_gemm_nt_contiguous,
+        m_grouped_fp8_gemm_nt_contiguous_with_starts,
         m_grouped_fp8_gemm_nn_contiguous,
         m_grouped_fp8_gemm_nt_masked,
         k_grouped_fp8_gemm_nt_contiguous,

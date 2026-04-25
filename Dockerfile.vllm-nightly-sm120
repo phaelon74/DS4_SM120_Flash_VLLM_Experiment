@@ -1,0 +1,23 @@
+FROM vllm/vllm-openai:deepseekv4-cu130
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cuda-libraries-dev-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    b12x==0.7.0 \
+    nvidia-cutlass-dsl-libs-cu13==4.4.2
+
+COPY docker/patch_vllm_deepseekv4.py /tmp/patch_vllm_deepseekv4.py
+RUN python3 /tmp/patch_vllm_deepseekv4.py
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV TORCH_CUDA_ARCH_LIST=12.0
+ENV CUTE_DSL_ARCH=sm_120a
+ENV B12X_CUTE_COMPILE_CACHE_DIR=/tmp/b12x_cute_cache
+ENV VLLM_TARGET_DEVICE=cuda
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /workspace
