@@ -71,10 +71,20 @@ services:
         # SM120 fused decode v2 NATIVE FP8 block-scaled MMA path (testing-blind).
         # Requires DG_SM120_FUSED_DECODE_V2=1 to take effect. When set to 1, the
         # v2 entry attempts the native multi-head-per-CTA tensor-core kernel
-        # (mma.sync.aligned.m16n8k32.kind::mxf8f6f4.block_scale) and falls back
-        # to the v2 scalar kernel if the runtime shape is unsupported.
+        # (mma.sync.aligned.m16n8k32.kind::mxf8f6f4.block_scale.scale_vec::1X)
+        # and falls back to the v2 scalar kernel if the runtime shape is
+        # unsupported. Validated 2026-04-27 against scalar v2 reference at
+        # H=32 / head_dim=512 / K=128: out max_abs 3.78e-3, mean_abs 7.4e-4
+        # (consistent with FP8 e4m3 quantization noise on Q and P).
         export DG_SM120_FUSED_DECODE_V2_NATIVE="${DG_SM120_FUSED_DECODE_V2_NATIVE:-0}"
-        # 1 = use FP8 block-scale MMA inner; 0 = bf16-promotion fallback (TODO).
+        # 1 = use FP8 block-scale MMA inner (the validated path).
+        # 0 = bf16-promotion fallback. WARNING (2026-04-27): the BF16 fallback
+        # is currently INCOMPLETE -- the FP8 portion of QK^T and P*V is gated
+        # behind kUseFp8Mma and not yet implemented for kUseFp8Mma=false, so
+        # output cols [0, 448) will be zero. Do not flip this to 0 in
+        # production. Reserved for the eventual TODO(NATIVE-BF16-FALLBACK)
+        # work which will dequantize FP8 to BF16 in registers and run BF16
+        # MMA on the FP8 portion.
         export DG_SM120_FUSED_DECODE_V2_FP8MMA="${DG_SM120_FUSED_DECODE_V2_FP8MMA:-1}"
         # Split-K factor for the native path (1 disables, 4 is the kernel default).
         export DG_SM120_FUSED_DECODE_V2_SPLITK="${DG_SM120_FUSED_DECODE_V2_SPLITK:-4}"

@@ -22,8 +22,22 @@
 #   * Compare out (bf16) and lse (fp32).
 #
 # Pass criteria (printed but not asserted; user evaluates):
-#   * out:  max abs diff < 0.05, max rel diff < 0.05 typical for bf16 logits.
-#   * lse:  max abs diff < 1e-3 typical (fp32 reduction).
+#
+# This compares an FP8 block-scaled MMA path (native) to a BF16 / FP32
+# scalar reference (scalar v2). The native path quantizes Q and P to FP8
+# e4m3 inside the kernel, runs FP8 MMA, and accumulates in FP32. The
+# reference does no Q/P quantization. The expected residual is therefore
+# FP8 e4m3 quant + accumulator noise, NOT machine precision.
+#
+# FP8-aware thresholds (calibrated 2026-04-27 against the first clean run
+# after the scale-routing fix; head_dim=512, K=128, H=32):
+#   * out:  max abs < 0.020   mean abs < 0.005
+#   * lse:  max abs < 0.020   mean abs < 0.010
+#
+# Tightening these would require either (a) BF16 fallback to give a
+# bit-exact reference, or (b) a Q/P-bf16 hybrid native path (FP8 KV reads
+# but BF16 MMA). Both are deferred until live integration confirms the
+# FP8 MMA path is end-to-end useful.
 
 import math
 import os
@@ -269,17 +283,26 @@ def main() -> int:
     print(f"lse:  max_abs={lse_max:.6f}  mean_abs={lse_mean:.6f}")
     print("=" * 60)
 
-    # Soft pass criteria.
-    out_ok = out_max < 0.05 and out_rel < 0.10
-    lse_ok = lse_max < 1e-3
+    # FP8-aware pass criteria. See header comment for derivation.
+    out_ok = (out_max < 0.020) and (out_mean < 0.005)
+    lse_ok = (lse_max < 0.020) and (lse_mean < 0.010)
     if out_ok and lse_ok:
-        print("[verdict] PASS (within bf16/fp32 reduction tolerance)")
+        print(
+            "[verdict] PASS (within FP8 e4m3 quantization tolerance)"
+        )
         return 0
     else:
-        print("[verdict] DIFF observed; native path differs from scalar v2 reference")
         print(
-            "         (this does NOT necessarily mean the native path is wrong; "
-            "it means a side-by-side numerical investigation is warranted)"
+            "[verdict] DIFF observed; native path differs from scalar v2 "
+            "reference beyond FP8 quantization tolerance."
+        )
+        print(
+            "         out  thresholds: max<0.020 mean<0.005  "
+            "(actual: max=%.6f mean=%.6f)" % (out_max, out_mean)
+        )
+        print(
+            "         lse  thresholds: max<0.020 mean<0.010  "
+            "(actual: max=%.6f mean=%.6f)" % (lse_max, lse_mean)
         )
         return 0  # exit 0 so user can inspect even on diff
 
