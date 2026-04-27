@@ -182,19 +182,26 @@ __device__ __forceinline__ void stage_q_to_smem(
             vals[i] = (d < kHeadDim) ? load_q_value<QT>(row_base, d) : 0.0f;
         }
 
-        if (lane_qb < kNumQuantBlocks) {
-            // FP8 quant block. Each lane holds 16 dims; reduce max-abs across
-            // the 4-lane group (= 64 dims = one quant block).
-            float local_max = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                local_max = fmaxf(local_max, fabsf(vals[i]));
-            }
-            // 4-lane reduction: shuffle within consecutive lane group of size 4.
-            float qb_max = local_max;
-            qb_max = fmaxf(qb_max, __shfl_xor_sync(0xffffffffu, qb_max, 1));
-            qb_max = fmaxf(qb_max, __shfl_xor_sync(0xffffffffu, qb_max, 2));
+        // -------- WARP-UNIFORM 4-lane max reduction --------
+        // CRITICAL: __shfl_xor_sync(0xffffffffu, ...) requires ALL 32 lanes in
+        // the mask to execute a matching shuffle. If we put the shuffle inside
+        // `if (lane_qb < kNumQuantBlocks)`, lanes 28..31 (RoPE) skip it and
+        // hang the SM (100% util, no progress, no Xid). The reduction is
+        // therefore done uniformly here; lanes 28..31 contribute 0 to the
+        // 4-lane group max but still participate in the warp shuffle.
+        float local_max = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            local_max = fmaxf(local_max, fabsf(vals[i]));
+        }
+        float qb_max = local_max;
+        qb_max = fmaxf(qb_max, __shfl_xor_sync(0xffffffffu, qb_max, 1));
+        qb_max = fmaxf(qb_max, __shfl_xor_sync(0xffffffffu, qb_max, 2));
+        // ----------------------------------------------------
 
+        if (lane_qb < kNumQuantBlocks) {
+            // FP8 quant block. Each lane holds 16 dims; the 4-lane group max
+            // (= 64 dims = one quant block) was reduced above.
             const float scale     = pow2_round_up(qb_max / kE4M3Max);
             const float inv_scale = 1.0f / scale;
             const uint8_t ue8m0   = float_pow2_to_ue8m0(scale);
