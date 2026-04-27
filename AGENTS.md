@@ -61,8 +61,11 @@ Blackwell workstation GPUs, which report compute capability SM120.
 - `DG_SM120_BYPASS_TP_ALLREDUCE=0`
 - `DG_SM120_MHC_REUSE_BUFFERS=1`
 - `DG_SM120_HC_PRENORM_V2=1` (default-on tiled HC prenorm v2)
-- `DG_SM120_FUSED_DECODE_V2=0` (opt-in fused sparse MLA decode v2)
+- `DG_SM120_FUSED_DECODE_V2=1` (default-on fused sparse MLA decode v2, scalar-inner; multi-head-per-CTA grid, FP8 cache direct, online softmax)
 - `DG_SM120_FUSED_DECODE_V2_STRICT=0`
+- `DG_SM120_FUSED_DECODE_V2_NATIVE=0` (opt-in native FP8 block-scaled MMA inner; currently slower than v2 scalar)
+- `DG_SM120_FUSED_DECODE_V2_FP8MMA=1` (only consulted when NATIVE=1; the BF16 fallback inner is incomplete)
+- `DG_SM120_FUSED_DECODE_V2_SPLITK=1` (only consulted when NATIVE=1)
 - `DG_SM120_FUSED_PREFILL_V2=0` (opt-in fused sparse MLA prefill v2)
 - `DG_SM120_FUSED_PREFILL_V2_STRICT=0`
 
@@ -542,6 +545,39 @@ been reduced and bounded:
   activation/reduce cannot close the gap to 100+ tok/s alone.
 
 ## Recent Delta Since Last Commit
+
+- **SM120 fused decode v2 (scalar-inner) promoted to default 2026-04-27**.
+  Side-by-side warmed live benchmarks on the running service compared the
+  current v1 baseline (workspace BMM bridge) against v2 scalar (multi-head-
+  per-CTA grid, FP8 cache direct, online softmax, scalar fp32 inner) and
+  v2 native (FP8 block-scaled MMA inner). v2 scalar matched v1 at c1
+  (`85.10`/`86.02 tok/s` vs v1 baseline `85-90 tok/s`) and produced the
+  highest c4 aggregate steady decode ever measured on this fork
+  (`222.08 tok/s` warm vs prior best `199 tok/s`, +14%). Compose default
+  for `DG_SM120_FUSED_DECODE_V2` flipped from `0` to `1`. Tiny correctness
+  request still returned `OK.` with HTTP 200 immediately after the path
+  was activated. The native FP8-MMA inner remains opt-in behind
+  `DG_SM120_FUSED_DECODE_V2_NATIVE=1`; see "What Failed or Underperformed"
+  for the structural reasons it currently runs slower than v2 scalar
+  (Q→FP8 quant per layer, scalar P*V B-operand pack instead of
+  `ldmatrix.x2.trans`, 99 KB SMEM ceiling capping occupancy at 1 CTA/SM,
+  extra split-K reduce launch).
+- **v2 native FP8 block-scaled MMA decode kernel built and validated for
+  numerical correctness, but currently slower than v2 scalar and v1**. The
+  kernel under `csrc/sm120_sparse_mla_decode_v2_native.cu` plus headers
+  under `csrc/sm120_native_fp8/` implements
+  `mma.sync.aligned.m16n8k32.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0`
+  with PTX-correct quad-distributed scale operand routing for both QK^T
+  and P*V phases, plus split-K partials and a normalize-and-reduce kernel.
+  Synthetic correctness vs the v2 scalar reference: `out` max_abs
+  `3.78e-3`, `lse` max_abs roughly `5e-3` (consistent with FP8 e4m3 quant
+  noise on Q and P). Live decode performance (warmed):
+    - `SPLITK=1`: c1 `~59 tok/s`, c4 aggregate `~140 tok/s`.
+    - `SPLITK=4`: c1 `~67 tok/s`, c4 aggregate `~150 tok/s`.
+  Both regress vs v2 scalar (`~85`/`~222 tok/s`). Kept disabled by default;
+  remaining native work is `ldmatrix.x2.trans` for the P*V V-operand
+  (re-stage V in `[N=8,K=32]` SMEM order) and reducing `kHeadsPerCta` from
+  16 to 8 to drop SMEM enough for 2 CTAs/SM occupancy.
 
 - **SM120 v4flash 100tps plan — Phase 0/1.1/2/3 structural fusion landed**.
   This is the first batch of "real" SM120 kernels intended to replace the

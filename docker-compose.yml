@@ -64,9 +64,16 @@ services:
         export DG_SM120_PREFILL_GATHER_WORKSPACE="${DG_SM120_PREFILL_GATHER_WORKSPACE:-0}"
         export DG_SM120_PREFILL_DIRECT_FP8_MAP="${DG_SM120_PREFILL_DIRECT_FP8_MAP:-0}"
         export DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT="${DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT:-0}"
-        # SM120 fused decode v2: single-CTA, FP8 cache direct, online softmax.
-        # Default-off until live validation; flip to "1" to enable for c1.
-        export DG_SM120_FUSED_DECODE_V2="${DG_SM120_FUSED_DECODE_V2:-0}"
+        # SM120 fused decode v2: multi-head-per-CTA grid, FP8 cache direct, online
+        # softmax. The scalar-inner variant of this kernel was promoted to default
+        # 2026-04-27 after side-by-side benchmarking on the running service:
+        #   v1 baseline c1 warm:        85-90 tok/s
+        #   v2 scalar c1 warm:          85-86 tok/s (parity)
+        #   v2 scalar c4 warm aggregate: 222 tok/s (best ever; v1 best was 199)
+        # The native FP8-MMA inner remains opt-in behind
+        # DG_SM120_FUSED_DECODE_V2_NATIVE=1 (currently slower than v2 scalar; see
+        # AGENTS.md "What Failed or Underperformed").
+        export DG_SM120_FUSED_DECODE_V2="${DG_SM120_FUSED_DECODE_V2:-1}"
         export DG_SM120_FUSED_DECODE_V2_STRICT="${DG_SM120_FUSED_DECODE_V2_STRICT:-0}"
         # SM120 fused decode v2 NATIVE FP8 block-scaled MMA path (testing-blind).
         # Requires DG_SM120_FUSED_DECODE_V2=1 to take effect. When set to 1, the
@@ -239,7 +246,7 @@ services:
       DG_SM120_PREFILL_GATHER_WORKSPACE: "${DG_SM120_PREFILL_GATHER_WORKSPACE:-0}"
       DG_SM120_PREFILL_DIRECT_FP8_MAP: "${DG_SM120_PREFILL_DIRECT_FP8_MAP:-0}"
       DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT: "${DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT:-0}"
-      DG_SM120_FUSED_DECODE_V2: "${DG_SM120_FUSED_DECODE_V2:-0}"
+      DG_SM120_FUSED_DECODE_V2: "${DG_SM120_FUSED_DECODE_V2:-1}"
       DG_SM120_FUSED_DECODE_V2_STRICT: "${DG_SM120_FUSED_DECODE_V2_STRICT:-0}"
       DG_SM120_FUSED_DECODE_V2_NATIVE: "${DG_SM120_FUSED_DECODE_V2_NATIVE:-0}"
       DG_SM120_FUSED_DECODE_V2_FP8MMA: "${DG_SM120_FUSED_DECODE_V2_FP8MMA:-1}"
