@@ -33,6 +33,8 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include <cstdlib>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
@@ -40,6 +42,36 @@
 
 #include "jit_kernels/impls/sm120_sparse_mla_decode_v2.hpp"
 #include "utils/exception.hpp"
+
+// SM120 native FP8 path (testing-blind, default-off until validated).
+//   * mma_block_scale_fp8.cuh: PTX wrappers for m16n8k32 fp8 block-scale MMA
+//                              and m16n8k16 bf16 MMA, plus ldmatrix variants.
+//   * fp8_quant.cuh:           UE8M0 codec, block quantizers, FP8 packing.
+#include "sm120_native_fp8/mma_block_scale_fp8.cuh"
+#include "sm120_native_fp8/fp8_quant.cuh"
+
+// Forward declaration of the native FP8 v2 launch entry point. The
+// implementation lives in sm120_sparse_mla_decode_v2_native.cu (compiled as a
+// separate TU). Returns true on successful launch, false if the runtime
+// shape is unsupported by the native path (e.g. H % 16 != 0) and the caller
+// must fall back to the scalar kernel.
+namespace deep_gemm {
+namespace sm120_mla_v2 {
+namespace native {
+template <typename QT, typename OutT, typename IdxT>
+bool launch_sm120_fused_decode_v2_native(
+    const torch::Tensor& q,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& indices,
+    const torch::Tensor& topk_length,
+    const torch::Tensor& attn_sink,
+    torch::Tensor&       out,
+    torch::Tensor&       lse,
+    int                  block_size,
+    float                softmax_scale);
+}  // namespace native
+}  // namespace sm120_mla_v2
+}  // namespace deep_gemm
 
 namespace deep_gemm {
 namespace sm120_mla_v2 {
@@ -189,7 +221,7 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* smem) {
 }
 
 template <typename QT, typename OutT, typename IdxT>
-__global__ void __launch_bounds__(kThreads, 2) sm120_fused_decode_v2_kernel(
+__global__ void __launch_bounds__(kThreads, 2) sm120_fused_decode_v2_scalar_kernel(
     const QT* __restrict__ q,            // [B, H, head_dim]
     const uint8_t* __restrict__ cache,    // packed FP8 ds_mla cache, uint8
     const IdxT* __restrict__ indices,     // [B, 1, K]
@@ -462,7 +494,27 @@ void launch_sm120_fused_decode_v2(
             static_cast<int64_t>(k_cache.stride(0)) * k_cache.element_size();
     }
 
-    sm120_fused_decode_v2_kernel<QT, OutT, IdxT><<<grid, block, shared_bytes,
+    // Native FP8 path dispatch (testing-blind, default-off). Only attempts
+    // the native kernel when DG_SM120_FUSED_DECODE_V2_NATIVE=1 is set; if the
+    // native launch returns false (shape unsupported, e.g. H % 16 != 0) we
+    // fall through to the scalar kernel below. Compile errors in the native
+    // path will surface at build time regardless of the env flag.
+    {
+        const char* native_env = std::getenv("DG_SM120_FUSED_DECODE_V2_NATIVE");
+        const bool want_native =
+            (native_env != nullptr && native_env[0] != '\0' &&
+             std::atoi(native_env) != 0);
+        if (want_native) {
+            const bool ok =
+                native::launch_sm120_fused_decode_v2_native<QT, OutT, IdxT>(
+                    q, k_cache, indices, topk_length, attn_sink,
+                    out, lse, block_size, softmax_scale);
+            if (ok) return;
+            // else: fall through to scalar.
+        }
+    }
+
+    sm120_fused_decode_v2_scalar_kernel<QT, OutT, IdxT><<<grid, block, shared_bytes,
                                                    stream>>>(
         reinterpret_cast<const QT*>(q.data_ptr()),
         reinterpret_cast<const uint8_t*>(k_cache.data_ptr()),
