@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import gzip
 import json
 import re
 from pathlib import Path
@@ -98,8 +99,15 @@ def summarize_dg_tsv(path: Path, top: int) -> None:
         )
 
 
+def _open_trace(path: Path):
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
+
+
 def summarize_trace_json(path: Path, top: int) -> None:
-    data = json.load(path.open())
+    with _open_trace(path) as handle:
+        data = json.load(handle)
     agg: dict[str, list[float]] = collections.defaultdict(lambda: [0.0, 0.0, 0.0])
     for event in data.get("traceEvents", []):
         if event.get("cat") != "kernel" or event.get("ph") != "X":
@@ -131,7 +139,11 @@ def main() -> None:
     for path in args.profiles:
         if not path.exists():
             raise SystemExit(f"missing profile: {path}")
-        if path.suffix == ".json":
+        suffixes = path.suffixes
+        is_json = path.suffix == ".json" or (
+            len(suffixes) >= 2 and suffixes[-2] == ".json" and suffixes[-1] == ".gz"
+        )
+        if is_json:
             summarize_trace_json(path, args.top)
         else:
             summarize_dg_tsv(path, args.top)

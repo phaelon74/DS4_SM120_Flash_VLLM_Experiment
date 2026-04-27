@@ -550,13 +550,17 @@ been reduced and bounded:
   Side-by-side warmed live benchmarks on the running service compared the
   current v1 baseline (workspace BMM bridge) against v2 scalar (multi-head-
   per-CTA grid, FP8 cache direct, online softmax, scalar fp32 inner) and
-  v2 native (FP8 block-scaled MMA inner). v2 scalar matched v1 at c1
-  (`85.10`/`86.02 tok/s` vs v1 baseline `85-90 tok/s`) and produced the
-  highest c4 aggregate steady decode ever measured on this fork
-  (`222.08 tok/s` warm vs prior best `199 tok/s`, +14%). Compose default
-  for `DG_SM120_FUSED_DECODE_V2` flipped from `0` to `1`. Tiny correctness
-  request still returned `OK.` with HTTP 200 immediately after the path
-  was activated. The native FP8-MMA inner remains opt-in behind
+  v2 native (FP8 block-scaled MMA inner). v2 scalar matched v1 at both
+  c1 (`86.01`/`86.82 tok/s` warm vs v1 baseline `85-90 tok/s`) and c4
+  (`184.96 tok/s` warmed-aggregate vs v1 best `180-195 tok/s`). One earlier
+  c4 measurement showed `222.08 tok/s`, but two follow-up restarts
+  reproduced `184.96 tok/s` instead, so the 222 was a one-off and not
+  a steady-state win. Compose default for `DG_SM120_FUSED_DECODE_V2`
+  flipped from `0` to `1` because parity at the same correctness with a
+  cleaner kernel architecture (multi-head-per-CTA grid, FP8 cache direct,
+  no BF16 workspace materialization) is worth shipping over the workspace
+  BMM bridge. Tiny correctness request still returned `OK.` with HTTP 200
+  immediately after the path was activated, twice on separate restarts. The native FP8-MMA inner remains opt-in behind
   `DG_SM120_FUSED_DECODE_V2_NATIVE=1`; see "What Failed or Underperformed"
   for the structural reasons it currently runs slower than v2 scalar
   (Q→FP8 quant per layer, scalar P*V B-operand pack instead of
