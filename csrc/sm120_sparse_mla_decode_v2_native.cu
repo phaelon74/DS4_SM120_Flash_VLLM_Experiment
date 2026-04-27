@@ -721,21 +721,55 @@ sm120_fused_decode_v2_native_kernel(
                 uint32_t a_frag[4];
                 ldmatrix_x4_fp8_as_b16(a_frag, a_addr);
 
-                // ldmatrix V (B operand) k=32, n=8 (trans).
-                // V SMEM layout: [kCandsPerChunk, kFp8Dim] row-major.
-                // We want B = V[:, col0:col0+8], which is K-major-N-minor.
-                const uint32_t b_n     = col0 + (lane_id & 7);
-                const uint32_t b_k_off = 16u * ((lane_id >> 3) & 1);
-                const uint8_t* b_addr  =
-                    &kv_fp8_smem[b_k_off * kFp8Dim + b_n];
-                // TODO(VERIFY-LDM): B-operand for P*V is "K-major" but our
-                // SMEM is [cand, fp8_dim] = [N_for_QK, K_for_QK]. For P*V we
-                // re-interpret cand as K and fp8_dim as N. So the loaded
-                // 8x8 sub-fragments are at offsets (cand=k_off..k_off+8,
-                // dim=col0). The ldmatrix.x2.trans pattern below provides the
-                // address of the cand row at the dim col_base.
+                // V (B operand) for m16n8k32 fp8, K=32 cand × N=8 dim.
+                //
+                // SMEM layout is kv_fp8_smem[cand=K, fp8_dim=N], i.e. K-major
+                // with stride kFp8Dim bytes. The B-fragment register layout
+                // for mma.m16n8k32.row.col.f32.e4m3.e4m3.f32 is K-major as
+                // well, but ldmatrix cannot load this directly from our SMEM:
+                //   * .trans needs SMEM rows of 16 fp8 (= 8 b16); we only have
+                //     8 fp8 of N.
+                //   * non-trans needs each lane to provide a 16-byte-aligned
+                //     row address, but col0 advances in steps of 8 fp8 -- not
+                //     16 fp8 -- so addresses are not always 16-byte aligned.
+                //
+                // The misalignment was the actual cudaErrorMisalignedAddress
+                // observed at kernel launch. We replace the ldmatrix here
+                // with a per-lane scalar pack that matches the m16n8k32
+                // B-fragment layout exactly:
+                //
+                //   lane i = 4*n + kg         (n in [0,8), kg in [0,4))
+                //   b_frag[0]: K = kg*4..kg*4+3,    N = n   (low byte first)
+                //   b_frag[1]: K = kg*4+16..kg*4+19, N = n
+                //
+                // This is slower per-MMA-tile than ldmatrix but is the
+                // structurally simplest fix; once the MMA path is validated
+                // for correctness we can swap to a wider [N, K]-staged buffer
+                // and a real ldmatrix.x2.trans load.
+                // // TODO(NATIVE-PV-LDM): replace scalar pack with a real
+                // // ldmatrix once a [N=8, K=32] re-staging buffer for V is
+                // // added; that staging buffer is what PR #1 effectively
+                // // does for its split-K B-fragment.
                 uint32_t b_frag[2];
-                ldmatrix_x2_trans_fp8_as_b16(b_frag, b_addr);
+                {
+                    const int n_lane = lane_id >> 2;        // 0..7 (N col)
+                    const int kg     = lane_id & 3;         // 0..3 (K-quad)
+                    const int n_col  = col0 + n_lane;
+                    uint32_t bf0 = 0, bf1 = 0;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int k_lo = kg * 4 + j;        // 0..15
+                        const int k_hi = kg * 4 + j + 16;   // 16..31
+                        bf0 |= static_cast<uint32_t>(
+                                   kv_fp8_smem[k_lo * kFp8Dim + n_col])
+                               << (j * 8);
+                        bf1 |= static_cast<uint32_t>(
+                                   kv_fp8_smem[k_hi * kFp8Dim + n_col])
+                               << (j * 8);
+                    }
+                    b_frag[0] = bf0;
+                    b_frag[1] = bf1;
+                }
 
                 // Scales: P scale is per row (kHeadsPerCta lanes). V scale is
                 // per cand: cand i uses kv_scales_smem[i * 8 + col0/64].
@@ -796,13 +830,49 @@ sm120_fused_decode_v2_native_kernel(
                     uint32_t a_frag[4];
                     ldmatrix_x4_b16(a_frag, a_addr);
 
-                    // ldmatrix V_rope (B operand bf16), k=16 n=8.
-                    const uint32_t b_n     = rope_col0 + (lane_id & 7);
-                    const uint32_t b_k_off = 8u * ((lane_id >> 3) & 1);
-                    const __nv_bfloat16* b_addr =
-                        &kv_bf16_smem[(k0 + b_k_off) * kBf16Dim + b_n];
+                    // V_rope (B operand bf16), k=16 cand × n=8 dim.
+                    //
+                    // Same misalignment problem as the FP8 P*V B-load above:
+                    // kv_bf16_smem is [cand=K, rope_dim=N] row-major, so each
+                    // N-step is 2 bytes -- lane offsets land on b_n*2-byte
+                    // boundaries which are not 16-byte aligned in general.
+                    // ldmatrix.x2.trans.b16 needs 16-byte aligned per-lane
+                    // addresses. We scalar-pack the m16n8k16 bf16 B-fragment
+                    // by hand instead:
+                    //
+                    //   lane i = 4*n + kg          (n in [0,8), kg in [0,4))
+                    //   b_frag[0]:
+                    //     low  bf16 = V_rope[K=2*kg+0,  N=n]
+                    //     high bf16 = V_rope[K=2*kg+1,  N=n]
+                    //   b_frag[1]:
+                    //     low  bf16 = V_rope[K=2*kg+8,  N=n]
+                    //     high bf16 = V_rope[K=2*kg+9,  N=n]
+                    //
+                    // K is local to this k_iter's 16-element K block; the
+                    // outer loop offsets it via k0.
                     uint32_t b_frag[2];
-                    ldmatrix_x2_trans_b16(b_frag, b_addr);
+                    {
+                        const int n_lane = lane_id >> 2;     // 0..7
+                        const int kg     = lane_id & 3;      // 0..3
+                        const int n_col  = rope_col0 + n_lane;
+                        const int k_lo_0 = k0 + kg * 2 + 0;  // 0..15
+                        const int k_lo_1 = k0 + kg * 2 + 1;
+                        const int k_hi_0 = k0 + kg * 2 + 8;
+                        const int k_hi_1 = k0 + kg * 2 + 9;
+                        // Read bf16 SMEM as raw 16-bit words for clean pack.
+                        const uint16_t* kv_bf16_u16 =
+                            reinterpret_cast<const uint16_t*>(kv_bf16_smem);
+                        const uint32_t lo0 = static_cast<uint32_t>(
+                            kv_bf16_u16[k_lo_0 * kBf16Dim + n_col]);
+                        const uint32_t lo1 = static_cast<uint32_t>(
+                            kv_bf16_u16[k_lo_1 * kBf16Dim + n_col]);
+                        const uint32_t hi0 = static_cast<uint32_t>(
+                            kv_bf16_u16[k_hi_0 * kBf16Dim + n_col]);
+                        const uint32_t hi1 = static_cast<uint32_t>(
+                            kv_bf16_u16[k_hi_1 * kBf16Dim + n_col]);
+                        b_frag[0] = lo0 | (lo1 << 16);
+                        b_frag[1] = hi0 | (hi1 << 16);
+                    }
 
                     float pv_new[4];
                     mma_bf16_m16n8k16(pv_new, a_frag, b_frag, out_acc[t]);
