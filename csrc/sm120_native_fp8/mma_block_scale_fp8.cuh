@@ -30,17 +30,30 @@
 //   * C/D are 16 rows x  8 cols, fp32 -> 4 fp32 regs/lane
 //
 // Scale-operand layout (scale_vec::1X, K=32 block, M=16 / N=8):
-//   * For A: 16 scales total (one per row), distributed across the 32 lanes.
-//     Per the PTX 8.7 spec, lanes 0-15 each provide 1 scale byte; the byte
-//     position within the lane's u32 is selected by a per-instruction
-//     immediate `byte_id_a`. The wrapper here always packs a single scale byte
-//     into byte 0 of the u32 (so byte_id_a is hard-coded to 0). Lanes 16-31
-//     pass don't-care zeros. NOTE: this is the layout I am running with
-//     testing-blind. If ptxas complains about "operand byte_id" or "scale
-//     vector size", this is the first thing to revisit. // TODO(VERIFY-PTX)
 //
-//   * For B: 8 scales total (one per col), distributed across lanes 0-7. Same
-//     pack-in-byte-0 convention, byte_id_b hard-coded to 0. // TODO(VERIFY-PTX)
+// CORRECTED 2026-04-27 after observed scale-routing bug:
+//   The first version of this kernel set scales on lanes 0..15 (for A) and
+//   lanes 0..7 (for B) by lane index. That produced the right output for
+//   M=row 0 / N=cols 0,1 but pure-zero scale for cols 2..7, because PTX does
+//   NOT read scales by lane-index-in-row-order. With selectors
+//   {byte_id=0, thread_id=0} the PTX reads from a *quad-distributed* subset:
+//
+//     * For A (M=16, scale_vec::1X, thread_id_a=0):
+//         32 lanes -> 16 scale bytes; PTX reads from
+//         lanes (4q+0, 4q+1) for q=0..7, i.e.
+//         {0,1, 4,5, 8,9, 12,13, 16,17, 20,21, 24,25, 28,29}.
+//         The mapping lane (4q+t) -> M-row r=2q+t (for t in {0,1}).
+//         All other lanes pass don't-care zeros.
+//
+//     * For B (N=8, scale_vec::1X, thread_id_b=0):
+//         32 lanes -> 8 scale bytes; PTX reads from
+//         lanes (4q+0) for q=0..7, i.e. {0,4,8,12,16,20,24,28}.
+//         The mapping lane (4q) -> N-col c=q.
+//         All other lanes pass don't-care zeros.
+//
+//   The byte position within a contributing lane's u32 is selected by
+//   byte_id_a / byte_id_b, hard-coded to 0 here. We always pack the single
+//   scale byte into byte 0 of the u32 (see pack_scale_byte0).
 //
 // Numerical conventions:
 //   * UE8M0 byte 0 means "scale = 0"; we follow PR #1 and pre-clamp this to
