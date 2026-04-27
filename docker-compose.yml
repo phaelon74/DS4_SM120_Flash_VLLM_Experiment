@@ -247,7 +247,7 @@ services:
       DG_SM120_PROFILE_MOE_SHAPES: "${DG_SM120_PROFILE_MOE_SHAPES:-0}"
       DG_SM120_PROFILE_MOE_EVERY: "${DG_SM120_PROFILE_MOE_EVERY:-1}"
       DG_SM120_MOE_PROFILE_PATH: "${DG_SM120_MOE_PROFILE_PATH:-/tmp/dg_sm120_moe_shapes.jsonl}"
-      MAX_JOBS: "16"
+      MAX_JOBS: "${MAX_JOBS:-40}"
     volumes:
       - .:/workspace/DeepGEMM
       - ./vllm_src:/workspace/vllm
