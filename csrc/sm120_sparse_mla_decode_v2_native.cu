@@ -43,6 +43,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <torch/python.h>
 
 #include "utils/exception.hpp"
 
