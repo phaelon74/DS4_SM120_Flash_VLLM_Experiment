@@ -115,17 +115,24 @@ __device__ __forceinline__ void mma_bf16_m16n8k16(
 // range contribute zero. The caller is responsible for routing the per-row /
 // per-col scale into the correct lane's `scale_a` / `scale_b` register.
 //
-// // TODO(VERIFY-PTX): the exact PTX form of the block_scale variant. PTX
-// 8.7 syntax (CUDA 12.8+) is:
-//   mma.sync.aligned.m16n8k32.kind::f8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32
-//     {d}, {a}, {b}, {c}, scale_a, scale_b, byte_id_a, byte_id_b;
-// where byte_id_a/byte_id_b are 2-bit immediates selecting which byte of the
-// u32 scale registers. We hard-code byte 0 (immediate 0) below. If ptxas
-// rejects the "byte_id" operand naming or the "scale_vec::1X" qualifier, the
-// alternates to try are:
-//   (a) scale_vec::1X -> scale_vec::2X
-//   (b) drop byte_id immediates (some PTX revisions encode them differently)
-//   (c) prefix with "kind::f8f6f4" before "block_scale"
+// PTX ISA 8.8 syntax for SM120f block-scaled MMA (verified against PTX docs):
+//   mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X
+//                  .f32.e4m3.e4m3.f32.ue8m0
+//     {d}, {a}, {b}, {c}, scaleA, {bid_a, tid_a}, scaleB, {bid_b, tid_b};
+// where {bid, tid} is a STRUCTURED operand selector (not two separate
+// immediates):
+//   * bid (byte_id, .u16): which byte of the u32 scale register to use [0..3]
+//   * tid (thread_id, .u16): which thread-pair-within-quad provides the
+//     scale; 0 = lower pair (lanes %4 in {0,1}), 1 = upper pair (lanes %4 in
+//     {2,3}).
+// We hard-code {0, 0} for both scaleA and scaleB: scale byte 0 of the
+// u32, lower-pair lanes provide scales. The kernel is responsible for
+// populating scaleA on lanes %4 in {0,1} (rows) and scaleB on lane 0
+// (cols 0..7 share a scale).
+//
+// Required compile target: sm_120a or sm_120f (compose currently uses
+// sm_120f). // TODO(VERIFY-MMA-SCALE) on the kernel-side lane->scale
+// distribution if numerical mismatch surfaces in correctness checks.
 __device__ __forceinline__ void mma_e4m3_block_scale_m16n8k32(
     float       (&d)[4],
     const uint32_t a[4],
@@ -135,13 +142,13 @@ __device__ __forceinline__ void mma_e4m3_block_scale_m16n8k32(
     uint32_t     scale_b) {
 #if DG_SM120_NATIVE_FP8_HAS_F8MMA
     asm volatile(
-        "mma.sync.aligned.m16n8k32.kind::f8f6f4.block_scale.scale_vec::1X."
-        "f32.e4m3.e4m3.f32 "
+        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale."
+        "scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 "
         "{%0, %1, %2, %3}, "
         "{%4, %5, %6, %7}, "
         "{%8, %9}, "
         "{%10, %11, %12, %13}, "
-        "%14, %15, 0, 0;\n"
+        "%14, {0, 0}, %15, {0, 0};\n"
         : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
           "r"(b[0]), "r"(b[1]),
