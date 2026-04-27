@@ -906,10 +906,29 @@ sm120_fused_decode_v2_native_kernel(
     // ---- 4. Epilogue: write out + LSE ------------------------------------
     // Each warp writes its kColsPerWarp slice of out_acc to global memory.
     // Lane fragment owns rows (l/4) and (l/4 + 8) of M, cols (l%4)*2..+1 of N.
-
-    // First normalize by row_sum if kSplitK == 1 (single-split case).
-    // For kSplitK > 1, write un-normalized partial out + lse partial; the
-    // reduce kernel divides by the global sum.
+    //
+    // CORRECTNESS NOTE (2026-04-27, was wrong before):
+    //
+    // Previously this code wrote UN-normalized out_partial when kSplitK > 1,
+    // intending the split-K reduce kernel to divide. But the reduce kernel
+    // computes weight[k] = exp(lse_partial[k] - global_max) which equals
+    //   exp(m_k - global_max) * l_split_k.
+    // So combining un-normalized out_partial[k] with that weight gives an
+    // extra factor of l_split_k in the output -- typically ~kCandsPerChunk
+    // = 32 amplification observed in the synthetic test.
+    //
+    // The correct pattern is to write WITHIN-SPLIT-NORMALIZED out_partial
+    // (i.e. out_partial = sum_c exp(qk_c - m_k) v_c / l_split_k) AND LSE
+    // partial = m_k + log(l_split_k). Then the reduce kernel's
+    // exp(lse_partial - global_max) weight correctly combines them: numerator
+    // becomes sum_k exp(m_k - global_max) * out_unnorm[k] / 1, denominator
+    // becomes sum_k exp(m_k - global_max) * l_split_k, giving the right
+    // overall normalization. This matches the standard FlashAttention
+    // split-K pattern (e.g. flash_attn split_kv reduce).
+    //
+    // Fix: always normalize by l in the partial kernel, regardless of
+    // kSplitK. The kSplitK == 1 case is unaffected (it was already
+    // normalizing; the reduce kernel is bypassed entirely).
 
     const int row0 = lane_id / 4;
     const int row1 = row0 + 8;
@@ -917,15 +936,9 @@ sm120_fused_decode_v2_native_kernel(
 
     const float l0 = row_state_smem[kHeadsPerCta + row0];
     const float l1 = row_state_smem[kHeadsPerCta + row1];
-    const float m0 = row_state_smem[row0];
-    const float m1 = row_state_smem[row1];
 
-    const float inv0 = (kSplitK == 1)
-                         ? ((l0 > 0.0f) ? (1.0f / l0) : 0.0f)
-                         : 1.0f;
-    const float inv1 = (kSplitK == 1)
-                         ? ((l1 > 0.0f) ? (1.0f / l1) : 0.0f)
-                         : 1.0f;
+    const float inv0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f;
+    const float inv1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
 
     const int64_t out_row0_off = static_cast<int64_t>(b) * out_stride_b
                                + static_cast<int64_t>(h0 + row0) * out_stride_h

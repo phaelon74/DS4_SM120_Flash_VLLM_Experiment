@@ -86,8 +86,16 @@ services:
         # work which will dequantize FP8 to BF16 in registers and run BF16
         # MMA on the FP8 portion.
         export DG_SM120_FUSED_DECODE_V2_FP8MMA="${DG_SM120_FUSED_DECODE_V2_FP8MMA:-1}"
-        # Split-K factor for the native path (1 disables, 4 is the kernel default).
-        export DG_SM120_FUSED_DECODE_V2_SPLITK="${DG_SM120_FUSED_DECODE_V2_SPLITK:-4}"
+        # Split-K factor for the native path. Range: 1, 2, 4, 8.
+        # Default 1 (single CTA per row) was chosen 2026-04-27 after observing
+        # that K=128 with kCandsPerChunk=32 makes split-K=4 spawn 5 kernel
+        # launches/layer (4 partial + 1 reduce) for very little inner work,
+        # yielding lower decode tok/s than the single-CTA path. Increase only
+        # if profiling shows the partial kernel is occupancy-bound, e.g. for
+        # K >= 512 prefill-like shapes or aggressive concurrency.
+        # Correctness is preserved at any SPLITK >= 1 after the 2026-04-27 fix
+        # to write within-split-normalized out_partial.
+        export DG_SM120_FUSED_DECODE_V2_SPLITK="${DG_SM120_FUSED_DECODE_V2_SPLITK:-1}"
         # SM120 fused prefill v2: single-kernel, FP8 cache direct, online softmax.
         # Default-off; only used when chunk has no SWA half.
         export DG_SM120_FUSED_PREFILL_V2="${DG_SM120_FUSED_PREFILL_V2:-0}"
@@ -235,7 +243,7 @@ services:
       DG_SM120_FUSED_DECODE_V2_STRICT: "${DG_SM120_FUSED_DECODE_V2_STRICT:-0}"
       DG_SM120_FUSED_DECODE_V2_NATIVE: "${DG_SM120_FUSED_DECODE_V2_NATIVE:-0}"
       DG_SM120_FUSED_DECODE_V2_FP8MMA: "${DG_SM120_FUSED_DECODE_V2_FP8MMA:-1}"
-      DG_SM120_FUSED_DECODE_V2_SPLITK: "${DG_SM120_FUSED_DECODE_V2_SPLITK:-4}"
+      DG_SM120_FUSED_DECODE_V2_SPLITK: "${DG_SM120_FUSED_DECODE_V2_SPLITK:-1}"
       DG_SM120_FUSED_PREFILL_V2: "${DG_SM120_FUSED_PREFILL_V2:-0}"
       DG_SM120_FUSED_PREFILL_V2_STRICT: "${DG_SM120_FUSED_PREFILL_V2_STRICT:-0}"
       DG_SM120_HC_PRENORM_V2: "${DG_SM120_HC_PRENORM_V2:-1}"
