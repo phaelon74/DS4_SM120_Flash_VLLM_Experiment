@@ -49,6 +49,16 @@ export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-8080}"
 export TP="${TP:-4}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+
+# Where to load the model from. MODEL_PATH may be a local directory (full HF
+# snapshot incl. config.json, safetensors, tokenizer, and the DeepSeek V4 *.py
+# files) or an HF Hub repo id. Default falls back to HF Hub download; override
+# to your local snapshot path, e.g.:
+#   MODEL_PATH=/media/fmodels/deepseek-ai/DeepSeek-V4-Flash ./scripts/serve_baremetal.sh
+export MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
+# Stable served name (clients POST to `model: <MODEL_NAME>`). Leave alone unless
+# you know your clients will retarget; the regression gate hard-codes the HF id.
+export MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
@@ -194,11 +204,13 @@ fi
 
 # Print a small banner so logs are easy to grep.
 echo "[serve_baremetal] cwd=${REPO_ROOT}"
+echo "[serve_baremetal] MODEL_PATH=${MODEL_PATH}  MODEL_NAME=${MODEL_NAME}"
 echo "[serve_baremetal] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} TP=${TP} PORT=${PORT}"
 echo "[serve_baremetal] VLLM_SPECULATIVE_CONFIG_FILE=${VLLM_SPECULATIVE_CONFIG_FILE:-<unset>}"
 echo "[serve_baremetal] DG_SM120_HC_PRENORM_V2=${DG_SM120_HC_PRENORM_V2}  DG_SM120_FUSED_DECODE_V2=${DG_SM120_FUSED_DECODE_V2}  DG_SM120_FUSED_PREFILL_V2=${DG_SM120_FUSED_PREFILL_V2}"
 
-exec vllm serve deepseek-ai/DeepSeek-V4-Flash \
+exec vllm serve "${MODEL_PATH}" \
+  --served-model-name "${MODEL_NAME}" \
   --trust-remote-code \
   --attention-backend FLASHMLA_SPARSE \
   --moe-backend deep_gemm \

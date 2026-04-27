@@ -122,14 +122,15 @@ services:
         export DG_SM120_PROFILE_MOE_EVERY="${DG_SM120_PROFILE_MOE_EVERY:-1}"
         export DG_SM120_MOE_PROFILE_PATH="${DG_SM120_MOE_PROFILE_PATH:-/tmp/dg_sm120_moe_shapes.jsonl}"
         export VLLM_ALLREDUCE_USE_SYMM_MEM=0
-        exec vllm serve deepseek-ai/DeepSeek-V4-Flash \
+        exec vllm serve "$(printenv MODEL_PATH)" \
+          --served-model-name "$(printenv MODEL_NAME)" \
           --trust-remote-code \
           --attention-backend FLASHMLA_SPARSE \
           --moe-backend deep_gemm \
           --kv-cache-dtype fp8_ds_mla \
           --block-size 256 \
           --enable-expert-parallel \
-          -tp 2 \
+          -tp 4 \
           --tokenizer-mode deepseek_v4 \
           --tool-call-parser deepseek_v4 \
           --enable-auto-tool-choice \
@@ -155,7 +156,13 @@ services:
     ports:
       - "8080:8000"
     environment:
-      CUDA_VISIBLE_DEVICES: "0,1"
+      # Where to load the model from (inside the container).
+      # Defaults to the bind-mount target below; set MODEL_PATH=deepseek-ai/DeepSeek-V4-Flash
+      # on the host (and unset MODEL_LOCAL_DIR) to fall back to HF Hub download.
+      MODEL_PATH: "${MODEL_PATH:-/models/deepseek-v4-flash}"
+      # Stable name used by clients (curl/bench scripts hit `model: <MODEL_NAME>`).
+      MODEL_NAME: "${MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash}"
+      CUDA_VISIBLE_DEVICES: "0,1,2,3"
       CUDA_HOME: /usr/local/cuda
       TORCH_CUDA_ARCH_LIST: "12.0"
       TORCH_ALLOW_TF32_CUBLAS_OVERRIDE: "1"
@@ -246,10 +253,15 @@ services:
       - ./vllm_src:/workspace/vllm
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
       - ${HOME}/.cache/pip:/root/.cache/pip
+      # Local model snapshot (read-only). Override MODEL_LOCAL_DIR on the host
+      # to point at any directory containing config.json + safetensors + the
+      # DeepSeek V4 *.py files. The path inside the container is fixed at
+      # /models/deepseek-v4-flash and matches the MODEL_PATH default above.
+      - ${MODEL_LOCAL_DIR:-/media/fmodels/deepseek-ai/DeepSeek-V4-Flash}:/models/deepseek-v4-flash:ro
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0", "2"]
+              device_ids: ["0", "1", "2", "3"]
               capabilities: [gpu]
