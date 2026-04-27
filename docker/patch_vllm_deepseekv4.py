@@ -48,27 +48,6 @@ def patch_block_scaled_mm() -> None:
     path.write_text(source.replace(old, new))
 
 
-def patch_flashinfer_mxfp4_sm120() -> None:
-    path = Path(
-        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/"
-        "layers/fused_moe/experts/trtllm_mxfp4_moe.py"
-    )
-    source = path.read_text()
-    old = (
-        "        return p.is_cuda() and p.is_device_capability_family(100) "
-        "and has_flashinfer()\n"
-    )
-    new = (
-        "        return (p.is_cuda() and has_flashinfer() and "
-        "(p.is_device_capability_family(100) or p.is_device_capability(120)))\n"
-    )
-    if old not in source:
-        if "p.is_device_capability(120)" in source:
-            return
-        raise RuntimeError(f"Could not patch FlashInfer MXFP4 SM120 support in {path}")
-    path.write_text(source.replace(old, new, 1))
-
-
 def patch_triton_mxfp4_sm120() -> None:
     candidates = (
         Path(
@@ -1143,20 +1122,59 @@ def patch_deepseek_v4_direct_fp8_prefill_map() -> None:
                             chunk_N,
                             True,
                         )
-                        output_chunk, _, _ = direct_prefill(
-                            q[query_start:query_end],
-                            compressed_k_cache.view(torch.uint8).unsqueeze(-2),
-                            swa_k_cache.view(torch.uint8).unsqueeze(-2),
-                            workspace_map,
-                            combined_indices.unsqueeze(1),
-                            combined_lens,
-                            self.attn_sink,
-                            attn_metadata.block_size // self.compress_ratio,
-                            swa_metadata.block_size,
-                            q.shape[-1],
-                            self.scale,
-                            output[query_start:query_end],
+                        # SM120 fused prefill v2 fast-path: single-cache only.
+                        # Only valid when the SWA half of the workspace_map is
+                        # empty (chunk_N == 0), i.e. compressed-only chunks.
+                        # Two-cache chunks fall through to the existing
+                        # ``sm120_sparse_mla_prefill_from_two_fp8_workspace_map``.
+                        v2_prefill = getattr(
+                            dg_c, "sm120_sparse_mla_prefill_v2", None
                         )
+                        use_v2 = (
+                            __import__("os").environ.get(
+                                "DG_SM120_FUSED_PREFILL_V2", "0"
+                            ) == "1"
+                            and v2_prefill is not None
+                            and chunk_N == 0
+                        )
+                        output_chunk = None
+                        if use_v2:
+                            try:
+                                output_chunk, _, _ = v2_prefill(
+                                    q[query_start:query_end],
+                                    compressed_k_cache.view(torch.uint8).unsqueeze(-2),
+                                    workspace_map,
+                                    combined_indices.unsqueeze(1),
+                                    combined_lens,
+                                    self.attn_sink,
+                                    attn_metadata.block_size // self.compress_ratio,
+                                    q.shape[-1],
+                                    self.scale,
+                                    output[query_start:query_end],
+                                )
+                            except Exception:
+                                if (
+                                    __import__("os").environ.get(
+                                        "DG_SM120_FUSED_PREFILL_V2_STRICT", "0"
+                                    ) != "0"
+                                ):
+                                    raise
+                                output_chunk = None
+                        if output_chunk is None:
+                            output_chunk, _, _ = direct_prefill(
+                                q[query_start:query_end],
+                                compressed_k_cache.view(torch.uint8).unsqueeze(-2),
+                                swa_k_cache.view(torch.uint8).unsqueeze(-2),
+                                workspace_map,
+                                combined_indices.unsqueeze(1),
+                                combined_lens,
+                                self.attn_sink,
+                                attn_metadata.block_size // self.compress_ratio,
+                                swa_metadata.block_size,
+                                q.shape[-1],
+                                self.scale,
+                                output[query_start:query_end],
+                            )
                 except Exception:
                     if __import__("os").environ.get(
                         "DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT", "0"
@@ -1853,6 +1871,64 @@ def _sm120_flash_mla_sparse_decode_fwd(
         )
     import deep_gemm
     import os
+
+    # SM120 fused decode v2: single-CTA, FP8 cache direct, online softmax.
+    # Only used when there is no extra (SWA) cache to merge in. The sparse
+    # decode call site for c1/MTP shapes is single-cache, so this covers the
+    # hot path. Two-cache callers fall through to the existing workspace path.
+    if (
+        os.environ.get("DG_SM120_FUSED_DECODE_V2", "0") == "1"
+        and extra_k_cache is None
+        and head_dim_v == q.shape[-1]
+        and head_dim_v == 512
+    ):
+        decode_v2 = getattr(
+            getattr(deep_gemm, "_C", None),
+            "sm120_sparse_mla_decode_v2",
+            None,
+        )
+        if decode_v2 is not None:
+            try:
+                # k_cache layout: [num_blocks, block_size, 1, token_bytes+scale_bytes]
+                # When the patcher receives k_cache it is the raw fp8_ds_mla
+                # cache. block_size is k_cache.shape[1].
+                block_size = int(k_cache.shape[1])
+                q_v2 = q.squeeze(1)                      # [B, H, head_dim]
+                idx_v2 = indices.squeeze(1).unsqueeze(1) if indices.dim() == 4 else indices
+                if idx_v2.dim() == 2:
+                    idx_v2 = idx_v2.unsqueeze(1)         # [B, 1, K]
+                out_v2 = out.squeeze(1)                  # [B, H, head_dim]
+                cache_view = k_cache.view(torch.uint8)
+                if cache_view.dim() == 3:
+                    cache_view = cache_view.unsqueeze(-2)
+                out_returned, lse_v2 = decode_v2(
+                    q_v2,
+                    cache_view,
+                    idx_v2,
+                    topk_length,
+                    attn_sink,
+                    head_dim_v,
+                    softmax_scale,
+                    block_size,
+                    out_v2,
+                )
+                # Return shape contract: out is [B, 1, H, head_dim_v]; max
+                # logits is [B, 1, H] fp32. We synthesize max_logits as NaN to
+                # mirror the existing fallback.
+                max_logits = torch.full(
+                    (q.shape[0], 1, q.shape[2]),
+                    fill_value=float("nan"),
+                    device=q.device,
+                    dtype=torch.float32,
+                )
+                return out, max_logits
+            except Exception:
+                if (
+                    os.environ.get("DG_SM120_FUSED_DECODE_V2_STRICT", "0")
+                    != "0"
+                ):
+                    raise
+                # Fall through to the existing workspace path on any error.
     gather_indexed = getattr(
         getattr(deep_gemm, "_C", None),
         "sm120_dequantize_and_gather_indexed_k_cache",

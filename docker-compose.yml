@@ -64,6 +64,17 @@ services:
         export DG_SM120_PREFILL_GATHER_WORKSPACE="${DG_SM120_PREFILL_GATHER_WORKSPACE:-0}"
         export DG_SM120_PREFILL_DIRECT_FP8_MAP="${DG_SM120_PREFILL_DIRECT_FP8_MAP:-0}"
         export DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT="${DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT:-0}"
+        # SM120 fused decode v2: single-CTA, FP8 cache direct, online softmax.
+        # Default-off until live validation; flip to "1" to enable for c1.
+        export DG_SM120_FUSED_DECODE_V2="${DG_SM120_FUSED_DECODE_V2:-0}"
+        export DG_SM120_FUSED_DECODE_V2_STRICT="${DG_SM120_FUSED_DECODE_V2_STRICT:-0}"
+        # SM120 fused prefill v2: single-kernel, FP8 cache direct, online softmax.
+        # Default-off; only used when chunk has no SWA half.
+        export DG_SM120_FUSED_PREFILL_V2="${DG_SM120_FUSED_PREFILL_V2:-0}"
+        export DG_SM120_FUSED_PREFILL_V2_STRICT="${DG_SM120_FUSED_PREFILL_V2_STRICT:-0}"
+        # SM120 HC prenorm v2: tiled unified-kernel replacement for the scalar
+        # fallback. Default-on; safe to leave enabled across all N <= 64.
+        export DG_SM120_HC_PRENORM_V2="${DG_SM120_HC_PRENORM_V2:-1}"
         export DG_SM120_ENABLE_B12X_MOE="${DG_SM120_ENABLE_B12X_MOE:-0}"
         export DG_SM120_B12X_A1_GS="${DG_SM120_B12X_A1_GS:-1.0}"
         export DG_SM120_B12X_A2_GS="${DG_SM120_B12X_A2_GS:-1.0}"
@@ -193,6 +204,11 @@ services:
       DG_SM120_PREFILL_GATHER_WORKSPACE: "${DG_SM120_PREFILL_GATHER_WORKSPACE:-0}"
       DG_SM120_PREFILL_DIRECT_FP8_MAP: "${DG_SM120_PREFILL_DIRECT_FP8_MAP:-0}"
       DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT: "${DG_SM120_PREFILL_DIRECT_FP8_MAP_STRICT:-0}"
+      DG_SM120_FUSED_DECODE_V2: "${DG_SM120_FUSED_DECODE_V2:-0}"
+      DG_SM120_FUSED_DECODE_V2_STRICT: "${DG_SM120_FUSED_DECODE_V2_STRICT:-0}"
+      DG_SM120_FUSED_PREFILL_V2: "${DG_SM120_FUSED_PREFILL_V2:-0}"
+      DG_SM120_FUSED_PREFILL_V2_STRICT: "${DG_SM120_FUSED_PREFILL_V2_STRICT:-0}"
+      DG_SM120_HC_PRENORM_V2: "${DG_SM120_HC_PRENORM_V2:-1}"
       DG_SM120_ENABLE_B12X_MOE: "${DG_SM120_ENABLE_B12X_MOE:-0}"
       DG_SM120_B12X_A1_GS: "${DG_SM120_B12X_A1_GS:-1.0}"
       DG_SM120_B12X_A2_GS: "${DG_SM120_B12X_A2_GS:-1.0}"

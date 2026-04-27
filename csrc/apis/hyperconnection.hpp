@@ -6,6 +6,8 @@
 #include "../jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm120_hc_prenorm_fallback.hpp"
+#include "../jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp"
+#include <cstdlib>
 #endif
 
 namespace deep_gemm::hyperconnection {
@@ -54,7 +56,17 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
     } else if (arch_major == 10) {
         sm100_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else if (arch_major == 12) {
-        sm120_tf32_hc_prenorm_gemm_fallback(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
+        // Prefer the v2 unified kernel; fall back to the original scalar
+        // implementation if env-disabled or if N exceeds the v2 cap (64).
+        const char* env = std::getenv("DG_SM120_HC_PRENORM_V2");
+        const bool use_v2 = (env == nullptr) || (env[0] != '0');
+        if (use_v2 && n <= 64) {
+            sm120_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k,
+                                       num_splits.has_value() ? num_splits.value() : 1);
+        } else {
+            sm120_tf32_hc_prenorm_gemm_fallback(a, b, d, sqr_sum, m, n, k,
+                                                num_splits.has_value() ? num_splits.value() : 1);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

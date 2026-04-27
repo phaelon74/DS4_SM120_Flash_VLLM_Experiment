@@ -60,10 +60,21 @@ Blackwell workstation GPUs, which report compute capability SM120.
 - default speculative config: `docker/vllm_speculative_mtp1_local_argmax.json` (`num_speculative_tokens=1`, local argmax reduction)
 - `DG_SM120_BYPASS_TP_ALLREDUCE=0`
 - `DG_SM120_MHC_REUSE_BUFFERS=1`
+- `DG_SM120_HC_PRENORM_V2=1` (default-on tiled HC prenorm v2)
+- `DG_SM120_FUSED_DECODE_V2=0` (opt-in fused sparse MLA decode v2)
+- `DG_SM120_FUSED_DECODE_V2_STRICT=0`
+- `DG_SM120_FUSED_PREFILL_V2=0` (opt-in fused sparse MLA prefill v2)
+- `DG_SM120_FUSED_PREFILL_V2_STRICT=0`
 
 Keep `DG_SM120_BYPASS_TP_ALLREDUCE=0` for valid output. Setting it to `1` is a
 diagnostic-only invalid-output path used to estimate tensor-parallel
 communication overhead.
+
+The `*_V2` flags above are the new "production v2" SM120 kernel paths added by
+the `sm120_v4flash_100tps` plan. `DG_SM120_HC_PRENORM_V2` is default-on and
+safe; the fused decode and prefill v2 flags are opt-in until live validation
+on real DeepSeek V4 Flash traffic. See `docs/SM120_FUSED_KERNELS.md` for the
+full design and `docs/SM120_SMEM_BUDGET.md` for the SMEM audit table.
 
 ## What Has Been Implemented
 
@@ -104,8 +115,13 @@ SM120-specific CUDA/C++ sources are present:
 - `csrc/sm120_fp8_fp4_cutlass.cu`
 - `csrc/sm120_fp8_gemm_fallback.cu`
 - `csrc/sm120_mqa_logits_fallback.cu`
-- `csrc/sm120_hc_prenorm_fallback.cu`
-- `csrc/sm120_sparse_mla_decode.cu`
+- `csrc/sm120_hc_prenorm_fallback.cu` *(legacy scalar fallback; v2 default-on)*
+- `csrc/sm120_tf32_hc_prenorm_gemm.cu` *(NEW; Phase 1.1 production v2)*
+- `csrc/sm120_sparse_mla_decode.cu` *(workspace bridge; v2 opt-in)*
+- `csrc/sm120_sparse_mla_decode_v2.cu` *(NEW; Phase 2 fused decode)*
+- `csrc/sm120_sparse_mla_prefill_v2.cu` *(NEW; Phase 3 fused prefill)*
+- `csrc/sm120_moe_activation_quant.cu`
+- `csrc/sm120_metadata.cu`
 - `csrc/sm120_profile.hpp`
 
 Important implemented paths:
@@ -526,6 +542,67 @@ been reduced and bounded:
   activation/reduce cannot close the gap to 100+ tok/s alone.
 
 ## Recent Delta Since Last Commit
+
+- **SM120 v4flash 100tps plan — Phase 0/1.1/2/3 structural fusion landed**.
+  This is the first batch of "real" SM120 kernels intended to replace the
+  scalar/workspace-bridge duct-tape paths. All v2 paths are written without
+  iterative testing on the dev box; validation must be done on a real 4x RTX
+  PRO 6000 host using the steps in `INSTALL_AND_TEST.md`.
+  - Added `csrc/sm120_tf32_hc_prenorm_gemm.cu` plus
+    `csrc/jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp` and a dispatch
+    branch in `csrc/apis/hyperconnection.hpp`. The new kernel replaces the
+    scalar `csrc/sm120_hc_prenorm_fallback.cu` for any `n <= 64` HC prenorm
+    call and is selected by `DG_SM120_HC_PRENORM_V2=1` (default-on). Numerics
+    match the fallback bit-exactly (A as fp32 from bf16, B rounded to TF32,
+    fp32 accumulate). Tiled, warp-cooperative; explicit
+    `// TODO(SM120-MMA):` markers indicate where to slot in
+    `mma.sync.aligned.m16n8k8.f32.tf32.tf32.f32` later.
+  - Added `csrc/sm120_sparse_mla_decode_v2.cu` plus header. Single-CTA fused
+    sparse MLA decode that reads the `fp8_ds_mla` KV cache directly via the
+    same indices the workspace bridge would gather, computes Q*K^T / FA2-style
+    online softmax / P*V / BF16 epilogue all in one launch, no BF16 workspace
+    materialized. Inner Q*K^T and P*V loops are scalar fp32 today; MMA
+    upgrade target is `mma.sync.aligned.m16n8k32.f32.e4m3.e4m3.f32`. Exported
+    as `deep_gemm._C.sm120_sparse_mla_decode_v2`. Patcher fast-path in
+    `docker/patch_vllm_deepseekv4.py` is gated by `DG_SM120_FUSED_DECODE_V2`
+    (default-off) and only fires when there is no extra (SWA) cache to merge
+    in. Two-cache callers fall through to the existing workspace path.
+    `DG_SM120_FUSED_DECODE_V2_STRICT=1` re-raises errors instead of falling
+    back. Synthetic harness: `scripts/test_sm120_fused_decode.py`.
+  - Added `csrc/sm120_sparse_mla_prefill_v2.cu` plus header. Single-CTA fused
+    sparse MLA prefill mirroring the decode v2 layout. Reads the FP8 KV cache
+    directly via a `workspace_map` (one int32 per workspace row giving the
+    physical cache linear-slot index), masks invalid entries at score level
+    via `-INFINITY`, FA2 online softmax in registers, BF16 epilogue + fp32
+    LSE in one launch. Exported as
+    `deep_gemm._C.sm120_sparse_mla_prefill_v2`. Patcher fast-path in
+    `docker/patch_vllm_deepseekv4.py` is gated by `DG_SM120_FUSED_PREFILL_V2`
+    (default-off), only fires when the chunk has no SWA half (compressed-only
+    chunks). `DG_SM120_FUSED_PREFILL_V2_STRICT=1` re-raises errors. Synthetic
+    harness: `scripts/test_sm120_fused_prefill.py`. Microbench:
+    `scripts/bench_sm120_fused_decode.py`, `scripts/bench_sm120_hc_prenorm.py`.
+  - Removed unused `patch_flashinfer_mxfp4_sm120` from
+    `docker/patch_vllm_deepseekv4.py` (defined but never called from
+    `__main__`); this was dead code from an earlier iteration.
+  - Added Phase 0 regression gate: `scripts/regression_gate.sh` plus
+    `scripts/_regression_gate_runner.py`. Runs a deterministic c1/c4/4k/8k/16k
+    streaming matrix against a running vLLM service and asserts floor/cap
+    thresholds. Use `--baseline` to write `profiles/baseline_<label>.txt` for
+    later phases to compare against. Default thresholds match the current
+    AGENTS.md baseline (c1 >= 85 tok/s, c4 >= 175 tok/s, 16k TTFT <= 18 s).
+  - Updated `setup.py` with the new v2 sources and `csrc/python_api.cpp` to
+    register the v2 APIs through `deep_gemm::sm120_mla_v2::register_apis`.
+  - Documentation added: `docs/SM120_FUSED_KERNELS.md` (architecture +
+    feature-flag matrix), `docs/SM120_SMEM_BUDGET.md` (per-kernel SMEM audit
+    table; Phase 1.2), `docs/CUTLASS_REBASE.md` (Phase 4 prep with PR #3121
+    requirement and K=64 tile plan), and the top-level `INSTALL_AND_TEST.md`
+    (steps for installing on a 4x RTX PRO 6000 box, building the extension,
+    running the regression gate, enabling v2 flags, and triaging failures).
+  - The `*_V2` flags are intentionally opt-in until live-validated.
+    `DG_SM120_HC_PRENORM_V2=1` is default-on because it is bit-exact with the
+    scalar fallback by construction; the fused decode/prefill v2 paths must
+    be turned on with explicit env vars after the regression gate is green
+    on the v1 baseline. See `INSTALL_AND_TEST.md` for the recommended order.
 
 - Added SM120 graph-native compressor metadata build (`sm120_build_compressor_metadata`) and patched vLLM `CompressorMetadataBuilder.build` to use it when available. This fuses token-to-request fill and block-table nonnegative clamp into one device launch, avoiding per-build CPU `repeat_interleave(...).pin_memory()` plus H2D copy and a separate Torch clamp launch.
 - Added SM120 graph-native sparse-SWA metadata build (`sm120_build_sparse_swa_metadata`) and patched vLLM `DeepseekSparseSWAMetadataBuilder.build` to use it when available. This fuses token-to-request fill, slot-validity generation, and decode-lens tail clearing into one device launch.
