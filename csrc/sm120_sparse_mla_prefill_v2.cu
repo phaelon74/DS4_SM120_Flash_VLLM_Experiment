@@ -30,6 +30,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include "jit_kernels/impls/sm120_sparse_mla_decode_v2.hpp"
 #include "jit_kernels/impls/sm120_sparse_mla_prefill_v2.hpp"
 #include "utils/exception.hpp"
 
