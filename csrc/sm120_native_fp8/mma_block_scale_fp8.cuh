@@ -198,19 +198,6 @@ __device__ __forceinline__ void ldmatrix_x2_fp8_as_b16(
     ldmatrix_x2_b16(out, smem_ptr);
 }
 
-// .trans variants reinterpreted for FP8: same b16 PTX, caller treats output
-// as packed FP8 (4 fp8 per b32). Used when the SMEM layout has the source
-// matrix transposed relative to the MMA fragment's expected K-major layout.
-__device__ __forceinline__ void ldmatrix_x4_trans_fp8_as_b16(
-    uint32_t (&out)[4], const void* smem_ptr) {
-    ldmatrix_x4_trans_b16(out, smem_ptr);
-}
-
-__device__ __forceinline__ void ldmatrix_x2_trans_fp8_as_b16(
-    uint32_t (&out)[2], const void* smem_ptr) {
-    ldmatrix_x2_trans_b16(out, smem_ptr);
-}
-
 // ldmatrix.trans variants (B operand for the fp8 m16n8k32 mma is K-major in
 // SMEM but needs K-major-fragment loads; A operand is row-major in SMEM and
 // needs row-major loads; trans is selected by caller).
@@ -230,6 +217,20 @@ __device__ __forceinline__ void ldmatrix_x2_trans_b16(
         "ldmatrix.sync.aligned.x2.trans.m8n8.shared::cta.b16 {%0, %1}, [%2];\n"
         : "=r"(out[0]), "=r"(out[1])
         : "r"(addr));
+}
+
+// .trans variants reinterpreted for FP8: same b16 PTX, caller treats output
+// as packed FP8 (4 fp8 per b32). Used when the SMEM layout has the source
+// matrix transposed relative to the MMA fragment's expected K-major layout.
+// Defined AFTER the b16 trans variants because they call them.
+__device__ __forceinline__ void ldmatrix_x4_trans_fp8_as_b16(
+    uint32_t (&out)[4], const void* smem_ptr) {
+    ldmatrix_x4_trans_b16(out, smem_ptr);
+}
+
+__device__ __forceinline__ void ldmatrix_x2_trans_fp8_as_b16(
+    uint32_t (&out)[2], const void* smem_ptr) {
+    ldmatrix_x2_trans_b16(out, smem_ptr);
 }
 
 }  // namespace sm120_native_fp8
