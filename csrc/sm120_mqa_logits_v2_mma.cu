@@ -354,15 +354,34 @@ fp8_mqa_logits_v2_mma_kernel(
                 &smem_q_pingpong[buf][q_m * kDPad + (k_global_off + q_k_off)];
             ldmatrix_x4_b16(a_regs, a_ptr);
 
-            // B operand (K rows for this warp, K=16 chunk, transposed via
-            // ldmatrix.trans). The base address per warp shifts by the warp's
-            // N offset; each lane reads one of the 8 N-rows in this warp.
+            // B operand (K rows for this warp, K=16 chunk).
+            //
+            // Our K SMEM is laid out [cand=N rows][rope_d=K cols], i.e.
+            // N-major. For ldmatrix.x2.trans semantics (per the PTX manual
+            // and the Hyunsung Lee PTX mental model blog), the .trans variant
+            // expects K-major SMEM (B stored as [K rows][N cols]) and
+            // delivers a transposed register fragment that matches the
+            // m16n8k16 B operand. With our N-major layout we instead want
+            // the *non-trans* x2 variant: each lane provides an N-row
+            // address, the 8 contiguous BF16 from that address are this
+            // lane's row's K-chunk, and after the load lane t's d[0] holds
+            // K[cand = warp_n_off + t/4, rope_d = k_global_off + 2*(t%4)+0..1]
+            // which is exactly B[k=2*(t%4)+0..1, n=t/4] in the MMA's
+            // col-major B register convention.
+            //
+            // The earlier C2a draft (and the existing native FP8 decode
+            // reference) used .trans on this same N-major SMEM, which
+            // produces a permuted B fragment and a max_diff ~10 against the
+            // scalar reference. The decode reference's downstream softmax +
+            // attention reduction is robust to the permutation so it didn't
+            // fail end-to-end serving, but our v2 unit test compares
+            // bit-exactly against a scalar Q @ K^T, so the bug is visible.
             uint32_t b_regs[2];
             const int n_for_lane = (k_n_off < n_in_warp) ? k_n_off : 0;
             const __nv_bfloat16* b_ptr =
                 &smem_k[(warp_id * kNPerWarp + n_for_lane) * kDPad
                         + (k_global_off + k_k_off)];
-            ldmatrix_x2_trans_b16(b_regs, b_ptr);
+            ldmatrix_x2_b16(b_regs, b_ptr);
 
             mma_bf16_m16n8k16(c_h, a_regs, b_regs, c_h);
         }
