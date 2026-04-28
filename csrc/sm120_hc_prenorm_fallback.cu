@@ -1,3 +1,31 @@
+// SM120 HyperConnection prenorm fallback (N > 64 path).
+//
+// dsl12x Phase 5c: this file is the fallback path for N > 64. The MMA
+// restructure planned in Phase 5b applies here too, with two added
+// considerations:
+//
+//   (a) N > 64 means at least 8 N sub-tiles of 8 per CTA. Two valid
+//       layouts:
+//         * one CTA per (split, m_tile_of_16) processing all N sub-tiles
+//           in a sequential warp loop (fewer CTAs, more SMEM staging
+//           per CTA). Recommended for N <= 128 based on the trace from
+//           Phase 5a.
+//         * one CTA per (split, m_tile_of_16, n_tile_of_8) (more CTAs,
+//           less per-CTA work). Recommended for N >= 256.
+//   (b) The fused per-row sum-of-squares stays bounded per CTA at 16
+//       FP32 lanes regardless of N tiling.
+//
+// For now this fallback file holds the existing scalar implementation
+// untouched. The Phase 5c MMA restructure will:
+//
+//   1. Add an mma_tf32_m16n8k8 helper (same PTX as
+//      csrc/sm120_tf32_hc_prenorm_gemm.cu line ~70).
+//   2. Add a templated hc_prenorm_mma_fallback_kernel<int kN_TILES> that
+//      dispatches based on the chosen layout above.
+//   3. Add a DG_SM120_HC_PRENORM_FALLBACK_MMA env-var gate in the host
+//      dispatcher (mirrors DG_SM120_HC_PRENORM_V2_MMA from v2 path).
+//   4. Default OFF until correctness + perf is validated on test system.
+
 #include <algorithm>
 
 #include <ATen/cuda/CUDAContext.h>

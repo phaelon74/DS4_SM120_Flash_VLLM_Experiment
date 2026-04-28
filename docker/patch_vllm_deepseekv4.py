@@ -1263,6 +1263,105 @@ def _sm120_flash_mla_sparse_prefill_fwd(
             (q.shape[0], q.shape[1], d_v), device=q.device, dtype=q.dtype
         )
 
+    # dsl12x Phase 1 trace hook (DG_SM120_PREFILL_V2_TRACE=1).
+    # One-time atomic-counter shape print, capped at 64 calls per process.
+    # Captures the live DeepSeek V4 Flash sparse prefill shape so the dsl12x
+    # kernel can be tuned to the real distribution. Runs BEFORE any kernel
+    # path so we always see the shape regardless of which fallback hits.
+    # Default OFF; only enabled in docker-compose.dsl12x.yml.
+    import os as _dg_sm120_trace_os
+    if _dg_sm120_trace_os.environ.get("DG_SM120_PREFILL_V2_TRACE", "0") in (
+        "1", "true", "TRUE", "yes", "YES", "on", "ON"
+    ):
+        _dg_trace_count = getattr(
+            _sm120_flash_mla_sparse_prefill_fwd, "_dg_sm120_prefill_trace_count", 0
+        )
+        if _dg_trace_count < 64:
+            setattr(
+                _sm120_flash_mla_sparse_prefill_fwd,
+                "_dg_sm120_prefill_trace_count",
+                _dg_trace_count + 1,
+            )
+            _dg_dtype_name = str(q.dtype).rsplit(".", 1)[-1]
+            _dg_has_attn_sink = attn_sink is not None
+            _dg_has_topk_length = topk_length is not None
+            _dg_q_shape = tuple(q.shape)
+            _dg_kv_shape = tuple(kv.shape)
+            _dg_idx_shape = tuple(indices.shape)
+            _dg_out_shape = tuple(out.shape)
+            import sys as _dg_sys
+            print(
+                f"[sm120_prefill_v2_trace #{_dg_trace_count}] "
+                f"seq_len={_dg_q_shape[0]} num_heads={_dg_q_shape[1]} "
+                f"qk_head_dim={_dg_q_shape[-1]} v_head_dim={d_v} "
+                f"topk_width={_dg_idx_shape[-1]} "
+                f"kv_total_tokens={_dg_kv_shape[0]} "
+                f"dtype={_dg_dtype_name} "
+                f"has_attn_sink={_dg_has_attn_sink} "
+                f"has_topk_length={_dg_has_topk_length} "
+                f"sm_scale={float(sm_scale):.6f} "
+                f"q_shape={_dg_q_shape} kv_shape={_dg_kv_shape} "
+                f"idx_shape={_dg_idx_shape} out_shape={_dg_out_shape}",
+                file=_dg_sys.stderr, flush=True,
+            )
+
+    # dsl12x sparse MLA prefill kernel branch (DG_SM120_DSL12X_PREFILL=1).
+    # Sits ABOVE the BMM bridge in the dispatch order. On any RuntimeError
+    # or CUDA error from the dsl12x kernel, fall through to the BMM bridge
+    # (which is the existing production path). DG_SM120_DSL12X_PREFILL_STRICT=1
+    # disables fall-through so the error surfaces immediately during
+    # development.
+    # Default OFF in production docker-compose.yml; default ON in
+    # docker-compose.dsl12x.yml sibling service.
+    if _dg_sm120_trace_os.environ.get("DG_SM120_DSL12X_PREFILL", "0") in (
+        "1", "true", "TRUE", "yes", "YES", "on", "ON"
+    ):
+        try:
+            from dsl12x.attention import prefill as _dsl12x_prefill
+            return _dsl12x_prefill.run_sparse_mla_prefill(
+                q=q,
+                kv=kv,
+                indices=indices,
+                sm_scale=sm_scale,
+                d_v=d_v,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+                out=out,
+            )
+        except Exception as _dsl12x_exc:
+            _dsl12x_strict = (
+                _dg_sm120_trace_os.environ.get(
+                    "DG_SM120_DSL12X_PREFILL_STRICT", "0"
+                ) in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+            )
+            if _dsl12x_strict:
+                raise
+            # One-time warning per error type so the operator sees the
+            # fall-through happened but logs do not flood.
+            _dsl12x_seen_errors = getattr(
+                _sm120_flash_mla_sparse_prefill_fwd,
+                "_dsl12x_seen_errors",
+                set(),
+            )
+            _dsl12x_err_key = (type(_dsl12x_exc).__name__, str(_dsl12x_exc)[:200])
+            if _dsl12x_err_key not in _dsl12x_seen_errors:
+                _dsl12x_seen_errors.add(_dsl12x_err_key)
+                setattr(
+                    _sm120_flash_mla_sparse_prefill_fwd,
+                    "_dsl12x_seen_errors",
+                    _dsl12x_seen_errors,
+                )
+                import sys as _dsl12x_sys
+                print(
+                    f"[dsl12x prefill] kernel failed "
+                    f"({type(_dsl12x_exc).__name__}: {_dsl12x_exc}); "
+                    f"falling back to BMM bridge for this and similar shapes. "
+                    f"Set DG_SM120_DSL12X_PREFILL_STRICT=1 to surface the "
+                    f"error immediately during development.",
+                    file=_dsl12x_sys.stderr, flush=True,
+                )
+            # Fall through to the existing BMM bridge below.
+
     try:
         import deep_gemm
         import os

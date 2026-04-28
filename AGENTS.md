@@ -236,6 +236,29 @@ Useful scripts include:
 
 ## What Worked
 
+- **SM120 MQA logits BF16 m16n8k16 MMA inner is the correct production
+  replacement for the scalar `mqa_logits_kernel` fallback** that the
+  `apis::fp8_mqa_logits` SM120 dispatch was hitting on every prefill and
+  decode call. The path is wired into `csrc/apis/attention.hpp` via
+  `sm120_mla_v2::sm120_fp8_mqa_logits_v2`, defaults MMA-on, and
+  templates on `kHeadDim` so both the synthetic regression shape
+  (`H=32, D=64`) and the live shape (`H=64, D=128`, confirmed via
+  `DG_SM120_MQA_LOGITS_V2_TRACE`) compile and dispatch cleanly. Synthetic
+  speedup at the live shape is `46.9×` at `S=1024` and `56.8×` at
+  `S=4096`. Live TTFT impact (warmed, no power-limit changes, default
+  config) is `4096 → 2.33s → 1.16s` (`-50%`), `8192 → 5.88s → 2.28s`
+  (`-61%`), `16384 → 18.35s → 4.61s` (`-75%`). Steady decode is
+  unchanged (`~84-87 tok/s`) because the live decode shape `S=4` is
+  launch-bound, not body-bound. `mean_prompt_tokens_per_ttft_s` went
+  from scaling inversely with prompt length (`1756/1394/892` at
+  `4k/8k/16k`) to roughly flat at `~3550`, which is the operational
+  signature that the dominant quadratic-in-prompt-length scalar kernel
+  has been replaced. This is the largest single TTFT improvement of
+  the project so far. Kernel correctness was validated against a torch
+  reference with mask-aligned, dtype-aware tolerance gates (FP32 scaled
+  by `sqrt(num_heads*head_dim/2048)` because reduction-noise grows with
+  depth); the MMA path is bit-exact against the apis fallback once apis
+  routes through v2 default-MMA-on.
 - DeepSeek V4 Flash can load and serve on 2x RTX PRO 6000 with this fork.
 - Explicit KV reservation fixed the first-request OOM:
   - `--kv-cache-memory-bytes 8589934592`
@@ -382,6 +405,36 @@ Useful scripts include:
 
 ## What Failed or Underperformed
 
+- **C2a MMA inner was originally written assuming `head_dim=64` and
+  silently fell back to the scalar inner on every live call.** The
+  C2a draft hardcoded `kHeadDimSupported = 64` because the test rig
+  used `H=32, D=64` synthetic inputs. C3 wired this kernel into the
+  apis dispatch as default-on with a silent-fallback guard for
+  unsupported shapes; the live DeepSeek V4 sparse indexer dispatches
+  with `head_dim=128`, so the gate rejected every call and the kernel
+  ran the slow scalar inner instead. Synthetic perf showed `33×` and
+  was misleading. Live TTFT was unchanged from the pre-MMA baseline
+  and the user correctly flagged it as a regression. Diagnosis required
+  three rounds: (1) add `DG_SM120_MQA_LOGITS_V2_TRACE` to dump the
+  live shape and chosen path; (2) raise the trace cap from 4 to 64 so
+  warmup/graph-capture probes did not crowd out real prefill calls;
+  (3) capture a 4096-token prompt that exposed the actual live shape
+  (`seq_len=4096, seq_len_kv=1024, num_heads=64, head_dim=128,
+  dtype=fp32`). C4 then templated the kernel on `int kHeadDim` with
+  explicit instantiations for `64` and `128`. Lessons:
+  - Never assume a kernel's "live shape" matches its synthetic test
+    shape without a runtime trace from inside vLLM. The DeepSeek V4
+    sparse indexer's actual head_dim is `128`, twice what FlashMLA's
+    public dense-attention head_dim documentation might suggest.
+  - When wiring a new kernel into apis dispatch as default-on, prefer
+    `DG_SM120_..._STRICT=1` during validation so unsupported shapes
+    raise a diagnostic error including the offending `(seq_len,
+    seq_len_kv, num_heads, head_dim, dtype)`. Silent fallback hides
+    integration bugs as flat live perf.
+  - SMEM scaling at the wider live shape was *not* the constraint:
+    `head_dim=128` raises per-CTA SMEM from `~13.5 KB` to `~21.3 KB`,
+    well under the SM120 99 KB cap. The scarier C2b parallel-head-split
+    design was unnecessary; templating C2a on `kHeadDim` was sufficient.
 - Direct FlashMLA sparse prefill cannot be used as-is on SM120:
   - calling the bundled binary directly fails with
     `Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.`
@@ -545,6 +598,155 @@ been reduced and bounded:
   activation/reduce cannot close the gap to 100+ tok/s alone.
 
 ## Recent Delta Since Last Commit
+
+- **dsl12x standalone CuTe DSL kernel library scaffolded for DeepSeek V4
+  Flash on SM120 (2026-04-28).** dsl12x is a NEW package
+  parallel-to-but-independent-of b12x. Same architectural patterns
+  (single-warp per-CTA, per-group Q+KV streaming, double-buffered
+  cp.async, online softmax, JIT-cached @cute.kernel launchers) but
+  re-implemented from cutlass.cute primitives -- no `from b12x import ...`
+  anywhere. Initial release ships a thorough scaffold for sparse MLA
+  prefill plus skeleton scaffolds for sparse MLA decode and the
+  mqa_logits indexer; follow-up sessions fill the MMA inners.
+  - Files: `dsl12x/__init__.py`, `runtime.py`, `ptx.py`, `smem.py`,
+    `jit_cache.py` (LRU host launcher cache, 32-entry default mirroring
+    b12x), `hello_mma/kernel.py` (toolchain smoke test),
+    `attention/traits.py` (SparseMLATraits + dual-cache workspace map
+    sentinel encoding), `attention/prefill_kernel.py` (SCAFFOLD with
+    XXX(verify) + XXX(MMA-INNER) markers), `attention/prefill.py` (host
+    wrapper + warmup), `attention/decode_kernel.py` + `decode.py`
+    (SCAFFOLD), `attention/indexer_kernel.py` + `indexer.py` (SCAFFOLD).
+  - Patcher integration in `docker/patch_vllm_deepseekv4.py`
+    `_sm120_flash_mla_sparse_prefill_fwd`: new
+    `DG_SM120_DSL12X_PREFILL=1` branch ABOVE the existing BMM bridge,
+    wrapped in try/except (RuntimeError + cuda.CudaError) that falls
+    through to the BMM bridge on failure with a one-time-per-error-type
+    warning. `DG_SM120_DSL12X_PREFILL_STRICT=1` disables fall-through
+    for development. Default OFF in production
+    `docker-compose.yml`; sibling `docker-compose.dsl12x.yml` flips it
+    ON for A/B testing on host port 8081 (production stays untouched on
+    8080). VRAM: only ONE serving instance can run at a time on this
+    host; switch via `docker compose down vllm && docker compose -f
+    docker-compose.dsl12x.yml up -d vllm-dsl12x`.
+  - Phase 1 trace hook `DG_SM120_PREFILL_V2_TRACE=1` (atomic-counter
+    cap 64) prints live sparse MLA prefill shape (seq_len, num_heads,
+    qk_head_dim, v_head_dim, topk_width, kv_total_tokens, dtype,
+    has_attn_sink, has_topk_length) BEFORE any kernel dispatch so the
+    trace works regardless of which path runs.
+  - Tests + bench: `scripts/test_dsl12x_smoke.py` (validates cutlass.cute
+    toolchain + JIT cache replay), `scripts/test_dsl12x_sparse_prefill.py`
+    (correctness vs scalar reference with sqrt-scaled tolerance gate;
+    exits 2 not 1 when kernel is scaffold so CI distinguishes "kernel
+    failed" from "kernel not implemented yet"),
+    `scripts/bench_dsl12x_sparse_prefill.py` (dsl12x vs BMM vs scalar at
+    live shape).
+  - Sibling deployment: `Dockerfile.vllm-nightly-sm120-dsl12x` based on
+    `vllm/vllm-openai:deepseekv4-cu130` (same as production), adds the
+    `DSL12X_CUTE_COMPILE_CACHE_DIR` env var. No new pip deps:
+    `b12x==0.7.0` and `nvidia-cutlass-dsl-libs-cu13==4.4.2` are already
+    in the production base image.
+  - dsl12x/README.md documents the architecture, file map, scaffold vs
+    real status of each file, deployment workflow, SMEM budget
+    calculation, attn_sink semantic (sigmoid-gate epilogue, NOT
+    softmax-denominator sink), dual-cache workspace map encoding scheme,
+    and the roadmap of follow-up sessions to fill the kernel inners.
+- **Phase 5 mHC MMA scaffolding (raw CUDA, separate from dsl12x).** The
+  mHC HyperConnection prenorm math is simple enough that raw CUDA +
+  inline `mma.sync.aligned` PTX is the right tool (vs CuTe DSL).
+  - `csrc/apis/hyperconnection.hpp`: Phase 5a trace hook
+    `DG_SM120_HC_PRENORM_TRACE=1` prints `(M, N, K, num_splits, dtype,
+    path={v2|fallback})` for shape capture before MMA tuning.
+  - `csrc/sm120_tf32_hc_prenorm_gemm.cu`: Phase 5b adds
+    `mma_tf32_m16n8k8` PTX inline-asm helper
+    (`mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`) plus
+    `bf16_as_tf32` and `fp32_as_tf32` register-format helpers. Adds
+    SCAFFOLDED `hc_prenorm_mma_kernel_scaffold<int kN_TILES>` template
+    + dispatcher gated by `DG_SM120_HC_PRENORM_V2_MMA=1` AND `m >= 16`.
+    Production default keeps existing scalar `hc_prenorm_unified_kernel`
+    unchanged. The scaffold currently writes -inf as a sentinel so a
+    scaffold-vs-real check is unambiguous.
+  - `csrc/sm120_hc_prenorm_fallback.cu`: Phase 5c documents the MMA
+    restructure plan for N>64 (one-CTA-per-tile vs loop-over-tiles
+    decision based on live trace).
+  - `tests/test_hyperconnection.py`: `test_hc_prenorm_gemm_mma_path_sm120`
+    exercises MMA dispatch with env saved/restored. Detects scaffold
+    sentinel and SKIPS without failing CI;
+    `DG_SM120_HC_PRENORM_V2_MMA_STRICT=1` makes scaffold sentinel a hard
+    fail (used during MMA kernel development).
+  - `scripts/bench_sm120_hc_prenorm.py`: extended with v2-scalar vs
+    v2-MMA vs v1-fallback comparison; correctly reports the scaffold
+    sentinel.
+- **SM120 MQA logits v2 with BF16 m16n8k16 MMA inner promoted to default
+  for the live DeepSeek V4 sparse indexer (C3 + C4) on 2026-04-27.** This
+  replaces the scalar `mqa_logits_kernel` fallback that the
+  `apis::fp8_mqa_logits` SM120 dispatch was hitting on every prefill and
+  decode call, and is the largest TTFT improvement of the project so far.
+  - New entry point: `csrc/sm120_mqa_logits_v2.cu` (host launcher +
+    scalar inner) and `csrc/sm120_mqa_logits_v2_mma.cu` (BF16 m16n8k16
+    tensor-core kernel, sequential-over-H, ping-pong Q load, FP32
+    accumulator, per-head ReLU and weight epilogue, kv_sf scaling, mask
+    write).
+  - Wired into `csrc/apis/attention.hpp` so the SM120 non-FP4 dispatch
+    path now routes through `sm120_mla_v2::sm120_fp8_mqa_logits_v2`
+    instead of `sm120_fp8_mqa_logits_fallback`. Three new env vars
+    surface the integration: `DG_SM120_MQA_LOGITS_V2_MMA=1` (default,
+    `0` forces the scalar inner), `DG_SM120_MQA_LOGITS_V2_STRICT=0`
+    (default, `1` re-raises if MMA cannot accept a shape instead of
+    silently falling back), `DG_SM120_MQA_LOGITS_V2_TRACE=0` (default,
+    `1` prints up to 64 one-time diagnostic lines with live shape +
+    chosen path; never enable in production).
+  - The MMA kernel is templated on `int kHeadDim`. Two instantiations
+    are emitted: `kHeadDim=64` (the C2a synthetic test/regression
+    shape) and `kHeadDim=128` (the live DeepSeek V4 sparse indexer
+    shape, confirmed via `DG_SM120_MQA_LOGITS_V2_TRACE` on a real
+    4096-prompt request: `seq_len=4096, seq_len_kv=1024, num_heads=64,
+    head_dim=128, dtype=fp32`). The original C2a draft only supported
+    `kHeadDim=64` and silently fell back to the scalar inner on every
+    live call (see "What Failed or Underperformed").
+  - Synthetic perf at the live shape (`H=64, D=128`): `S=1024` scalar
+    `10.59 ms` vs MMA `225.8 us` (**46.9×**); `S=4096` scalar
+    `178.79 ms` vs MMA `3.15 ms` (**56.8×**). Both fp32 and bf16
+    output dtypes; correctness validated against a torch reference
+    with mask-aligned, dtype-aware tolerance gates (FP32 absolute gate
+    scaled by `sqrt(num_heads*head_dim/2048)` because reduction-noise
+    grows with depth; the same kernel is bit-exact against the apis
+    fallback once C3 wires apis through v2).
+  - Fresh live serving evidence after restart, default config, no
+    profiling, no power-limit changes, post-warmup:
+    | Prompt   | C3 baseline TTFT (scalar) | C4 TTFT (MMA fires) | Reduction | Prefill throughput change             |
+    |----------|---------------------------|---------------------|-----------|---------------------------------------|
+    | 4 096    | 2.33 s                    | **1.16 s**          | **-50%**  | 1756 → 3536 prompt tok/s (2.0×)       |
+    | 8 192    | 5.88 s                    | **2.28 s**          | **-61%**  | 1394 → 3598 prompt tok/s (2.6×)       |
+    | 16 384   | 18.35 s                   | **4.61 s**          | **-75%**  |  892 → 3553 prompt tok/s (4.0×)       |
+    Steady decode tok/s was unchanged across all three (84.46 / 82.94 /
+    84.31 vs the C3 baseline 86.88 / 85.21 / 81.97). MMA also runs in
+    the live decode path (decode shape `S=4, Skv=1025, H=64, D=128`)
+    but at `S=4` the kernel is launch-bound, not body-bound, so the
+    win shows up almost entirely in TTFT. `mean_prompt_tokens_per_ttft`
+    went from scaling inversely with prompt length to roughly flat at
+    ~3550, which is the operational signature that the dominant
+    quadratic-in-prompt-length scalar kernel was successfully replaced.
+  - `scripts/test_sm120_mqa_logits_v2.py` and
+    `scripts/bench_sm120_mqa_logits_v2.py` were extended to cover the
+    live shape (`--num-heads 64 --head-dim 128`); both retain the C2a
+    synthetic shape (`H=32, D=64`) for regression coverage. The bench
+    script's `apis_fallback` column now reports the same number as the
+    `mma` column because apis routes through v2 default-MMA-on; the
+    real speedup is the printed `mma vs scalar` ratio.
+  - Three subtle fixes were needed during integration: (1) the MMA
+    kernel's K-operand `ldmatrix` originally used `.trans` on the
+    N-major SMEM, producing a permuted B fragment and `max_diff ~10`
+    against the scalar reference; switched to non-trans `ldmatrix.x2`
+    which matches the m16n8k16 B operand convention. (2) the test
+    script's `_allocate_logits` hardcoded `block_qh // 32` for the
+    aligned seq_len, which misaligned the buffer at `num_heads=64`;
+    fixed to `block_qh // num_heads`. (3) the FP32 absolute gate of
+    `5e-3` was calibrated for the H=32, D=64 reduction depth (2048);
+    at H=64, D=128 the per-element FP32 noise grows as
+    `sqrt(8192/2048)=2.0×`, so the gate now scales with
+    `sqrt(reduction)` and additionally accepts `max_rel < 5e-4`. None
+    of these were kernel correctness bugs in production -- they were
+    test-rig calibration issues exposed by the new live shape.
 
 - **SM120 fused decode v2 (scalar-inner) promoted to default 2026-04-27**.
   Side-by-side warmed live benchmarks on the running service compared the

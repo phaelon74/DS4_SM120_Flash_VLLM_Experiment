@@ -63,23 +63,49 @@ def main():
 
     print(f"shape m={args.m} n={args.n} k={args.k} num_splits={args.num_splits}")
 
+    # v2 scalar kernel (production default).
     os.environ["DG_SM120_HC_PRENORM_V2"] = "1"
+    os.environ["DG_SM120_HC_PRENORM_V2_MMA"] = "0"
     us_v2 = _bench(run, args.iters, args.warmup)
     d_v2 = d.clone()
     s_v2 = s.clone()
-    print(f"  v2 unified : {us_v2:8.3f} us")
+    print(f"  v2 scalar  : {us_v2:8.3f} us")
 
+    # v2 MMA path (dsl12x Phase 5 scaffold). When the kernel scaffold
+    # returns sentinel -inf (current state), we report the dispatch
+    # latency but not bit-exactness; once the kernel inner is filled
+    # in, this path should both correctness-match v2 scalar and be
+    # faster.
+    os.environ["DG_SM120_HC_PRENORM_V2_MMA"] = "1"
+    us_v2_mma = _bench(run, args.iters, args.warmup)
+    d_v2_mma = d.clone()
+    s_v2_mma = s.clone()
+    print(f"  v2 MMA     : {us_v2_mma:8.3f} us  (scaffold; -inf if not implemented)")
+
+    # v1 fallback (the original scalar kernel kept for diff comparison).
     os.environ["DG_SM120_HC_PRENORM_V2"] = "0"
+    os.environ["DG_SM120_HC_PRENORM_V2_MMA"] = "0"
     us_v1 = _bench(run, args.iters, args.warmup)
     d_v1 = d.clone()
     s_v1 = s.clone()
     print(f"  v1 fallback: {us_v1:8.3f} us")
-    print(f"  speedup    : {us_v1 / max(us_v2, 1e-6):5.2f}x")
+    print(f"  v1 vs v2 scalar speedup: {us_v1 / max(us_v2, 1e-6):5.2f}x")
+    if not bool(torch.isinf(d_v2_mma).any().item()):
+        print(f"  v2 scalar vs v2 MMA speedup: {us_v2 / max(us_v2_mma, 1e-6):5.2f}x")
 
     diff_d = (d_v1 - d_v2).abs().max().item()
     diff_s = (s_v1 - s_v2).abs().max().item()
-    print(f"  d max abs diff = {diff_d:.6e}")
-    print(f"  s max abs diff = {diff_s:.6e}")
+    print(f"  v1 vs v2 scalar:  d max abs diff = {diff_d:.6e}, s max abs diff = {diff_s:.6e}")
+    if not bool(torch.isinf(d_v2_mma).any().item()):
+        diff_d_mma = (d_v2 - d_v2_mma).abs().max().item()
+        diff_s_mma = (s_v2 - s_v2_mma).abs().max().item()
+        print(f"  v2 scalar vs v2 MMA: d max abs diff = {diff_d_mma:.6e}, s max abs diff = {diff_s_mma:.6e}")
+    else:
+        print(
+            "  v2 MMA: scaffold sentinel detected -- kernel inner not yet "
+            "implemented (see csrc/sm120_tf32_hc_prenorm_gemm.cu "
+            "hc_prenorm_mma_kernel_scaffold)"
+        )
 
 
 if __name__ == "__main__":

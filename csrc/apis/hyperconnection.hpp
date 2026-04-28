@@ -7,6 +7,8 @@
 #include "../jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm120_hc_prenorm_fallback.hpp"
 #include "../jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp"
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #endif
 
@@ -60,7 +62,33 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         // implementation if env-disabled or if N exceeds the v2 cap (64).
         const char* env = std::getenv("DG_SM120_HC_PRENORM_V2");
         const bool use_v2 = (env == nullptr) || (env[0] != '0');
-        if (use_v2 && n <= 64) {
+        const bool use_v2_path = (use_v2 && n <= 64);
+
+        // dsl12x Phase 5 trace hook (DG_SM120_HC_PRENORM_TRACE=1).
+        // One-time atomic-counter trace per process (cap 64). Captures the
+        // live (M, N, K, num_splits, dtype, path) distribution so the
+        // upcoming MMA-based mHC kernel (Phase 5b/c) can be tuned to the
+        // real shape mix. Default OFF; on by default in
+        // docker-compose.dsl12x.yml.
+        static std::atomic<int> _dg_sm120_hc_prenorm_trace_count{0};
+        const char* trace_env = std::getenv("DG_SM120_HC_PRENORM_TRACE");
+        const bool trace_enabled = (trace_env != nullptr) && (trace_env[0] != '0');
+        if (trace_enabled) {
+            int count = _dg_sm120_hc_prenorm_trace_count.fetch_add(1, std::memory_order_relaxed);
+            if (count < 64) {
+                std::fprintf(
+                    stderr,
+                    "[sm120_hc_prenorm_trace #%d] M=%lld N=%lld K=%lld num_splits=%d "
+                    "dtype_a=BF16 dtype_b=F32 dtype_d=F32 path=%s\n",
+                    count, static_cast<long long>(m),
+                    static_cast<long long>(n), static_cast<long long>(k),
+                    num_splits.has_value() ? num_splits.value() : 1,
+                    use_v2_path ? "v2" : "fallback");
+                std::fflush(stderr);
+            }
+        }
+
+        if (use_v2_path) {
             sm120_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k,
                                        num_splits.has_value() ? num_splits.value() : 1);
         } else {

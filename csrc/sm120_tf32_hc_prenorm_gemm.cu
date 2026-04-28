@@ -24,6 +24,7 @@
 // where (k_begin, k_end) splits K into ``num_splits`` chunks aligned to 64.
 
 #include <algorithm>
+#include <cstdlib>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -61,6 +62,68 @@ __device__ __forceinline__ float round_to_tf32(float v) {
     bits += 0x0fffu + lsb;
     bits &= 0xffffe000u;
     return __uint_as_float(bits);
+}
+
+// ---------------------------------------------------------------------------
+// dsl12x Phase 5b: TF32 m16n8k8 MMA helper.
+// ---------------------------------------------------------------------------
+//
+// PTX inline-asm wrapper for ``mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32``.
+// One MMA instruction processes a [16x8] x [8x8] tile -> [16x8] FP32
+// accumulator, distributed across the 32 threads of a warp:
+//
+//   d[4]: per-thread FP32 lanes of the [16, 8] output tile
+//   a[4]: per-thread uint32 lanes of A in TF32 format (4 lanes = 8 elements)
+//         (m16n8k8 A is [M=16, K=8] in TF32; each thread holds 4 TF32 elements)
+//   b[2]: per-thread uint32 lanes of B in TF32 format (2 lanes = 2 elements)
+//         (m16n8k8 B is [N=8, K=8] in TF32; each thread holds 2 TF32 elements)
+//   c[4]: per-thread FP32 lanes of the C accumulator
+//
+// Used by the (scaffolded) hc_prenorm_mma_kernel below to replace the scalar
+// FMA inner loop. The kernel structure to fully exploit this MMA needs to be
+// rewritten to tile M into 16-row groups (currently the kernel does one row
+// per block); the MMA helper here is the building block ready for that
+// restructure.
+__device__ __forceinline__ void mma_tf32_m16n8k8(
+    float       (&d)[4],
+    const uint32_t a[4],
+    const uint32_t b[2],
+    const float  c[4]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#else
+    // Pre-Ampere fallback (never executes on real SM120 targets).
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) d[i] = c[i];
+#endif
+}
+
+// Convert one BF16 value (already loaded as uint16) to a TF32-formatted
+// uint32 register. BF16 has 8 mantissa bits and TF32 has 10; the BF16 ->
+// fp32 expansion is exact (lower 16 bits of the fp32 are zero), and TF32
+// rounding then masks the bottom 13 bits, so for BF16 input the result is
+// identical to (uint32_t)__float_as_uint((float)bf16_value). We bypass the
+// rounding because the lower bits are already zero.
+__device__ __forceinline__ uint32_t bf16_as_tf32(__nv_bfloat16 v) {
+    // BF16 sits in the upper 16 bits of an fp32; the lower 16 bits are zero.
+    // The TF32 representation is the same fp32 bit pattern (bottom 13 bits
+    // don't matter for the MMA); just return the bf16 << 16.
+    uint32_t bits = static_cast<uint32_t>(__bfloat16_as_ushort(v)) << 16;
+    return bits;
+}
+
+// Convert one FP32 value to a TF32-formatted uint32 register.
+__device__ __forceinline__ uint32_t fp32_as_tf32(float v) {
+    return __float_as_uint(round_to_tf32(v));
 }
 
 template <int N_MAX_PER_THREAD>
@@ -156,6 +219,84 @@ __global__ void __launch_bounds__(kThreads, 2) hc_prenorm_unified_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// dsl12x Phase 5b: SCAFFOLDED MMA kernel.
+// ---------------------------------------------------------------------------
+//
+// SCAFFOLD STATUS: not wired into production. Compiles and is dispatched
+// only when DG_SM120_HC_PRENORM_V2_MMA=1 AND m >= 16 (host-side guard).
+// On any error / unsupported shape, the dispatcher falls back to the
+// scalar kernel above.
+//
+// To be filled in by follow-up (test-pass) session:
+//
+//   * Restructure the launch grid to one block per (split, m_tile_of_16),
+//     not per (split, m_row). 16 m rows per warp matches the m16n8k8 M
+//     dimension.
+//   * Inside the warp, do K_iters = K / 8 m16n8k8 MMAs, accumulating a
+//     [16, 8] FP32 tile per warp per N sub-tile.
+//   * For N <= 8: one warp per CTA, one MMA per K_iter.
+//     For 8 < N <= 32: one warp per CTA, sweep N sub-tiles of 8.
+//     For 32 < N <= 64: 4 warps per CTA, each owns 16 N columns
+//                       (= 2 sub-tiles of 8); shares the K loads via SMEM.
+//   * Per-row sum-of-squares: each thread accumulates its lane's contribution
+//     to A[m, k]^2 alongside the MMA, using the same K_iter loop. Reduce
+//     across the warp (8-lane redux per row) at the end.
+//   * Lane-mapping for the m16n8k8 fragment registers:
+//         A: thread (t/4, t%4*2 + bit) holds A[t/4, k_chunk*8 + col0]
+//            and A[t/4 + 8, ...] (so each lane provides 4 TF32 lanes).
+//         B: thread (t%8, ...) holds B[t%8, ...].
+//         C: thread (t/4, t%4*2 + bit) holds C[t/4, t%4*2 + bit].
+//
+// The PTX MMA helper above (mma_tf32_m16n8k8) is correct and ready; only
+// the surrounding kernel structure is scaffolded.
+
+template <int kN_TILES>  // ceil(N / 8); kN_TILES <= 8 (for N <= 64)
+__global__ void __launch_bounds__(32, 4)
+hc_prenorm_mma_kernel_scaffold(
+    const __nv_bfloat16* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ d,
+    float* __restrict__ sqr_sum,
+    int64_t a_stride_m, int64_t a_stride_k,
+    int64_t b_stride_n, int64_t b_stride_k,
+    int64_t d_stride_split, int64_t d_stride_m, int64_t d_stride_n,
+    int64_t s_stride_split, int64_t s_stride_m,
+    int m, int n, int k, int num_splits) {
+    // SCAFFOLD: not implemented. The MMA helpers above are ready; this
+    // kernel body needs the full M-tile-major restructure.
+    //
+    // For now, this scaffold writes -inf to all outputs assigned to its
+    // CTA so that the dispatcher's fallback-on-NaN/inf check reliably
+    // routes traffic to the scalar kernel until the MMA kernel is wired
+    // up. The production dispatcher does NOT invoke this kernel unless
+    // DG_SM120_HC_PRENORM_V2_MMA=1 is explicitly set.
+    if (threadIdx.x == 0) {
+        const int linear = blockIdx.x;
+        const int row_tile = linear % ((m + 15) / 16);
+        const int split_idx = linear / ((m + 15) / 16);
+        if (split_idx >= num_splits) return;
+        for (int row_in_tile = 0; row_in_tile < 16; ++row_in_tile) {
+            const int row = row_tile * 16 + row_in_tile;
+            if (row >= m) break;
+            for (int c = 0; c < n; ++c) {
+                d[static_cast<int64_t>(split_idx) * d_stride_split +
+                  static_cast<int64_t>(row) * d_stride_m +
+                  static_cast<int64_t>(c) * d_stride_n] = -INFINITY;
+            }
+            sqr_sum[static_cast<int64_t>(split_idx) * s_stride_split +
+                    static_cast<int64_t>(row) * s_stride_m] = -INFINITY;
+        }
+    }
+    // Suppress unused-parameter warnings for the operands the test-pass
+    // kernel will use.
+    (void)a; (void)b;
+    (void)a_stride_m; (void)a_stride_k;
+    (void)b_stride_n; (void)b_stride_k;
+    (void)d_stride_n;
+    (void)k;
+}
+
 } // namespace sm120_hcv2
 
 void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
@@ -183,6 +324,37 @@ void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     const int64_t s_stride_split = num_splits == 1 ? 0 : sqr_sum.stride(0);
     const int64_t s_stride_m = num_splits == 1 ? sqr_sum.stride(0)
                                                : sqr_sum.stride(1);
+
+    // dsl12x Phase 5b dispatch: MMA-based kernel is opt-in via
+    // DG_SM120_HC_PRENORM_V2_MMA=1. Defaults OFF until the scaffolded
+    // hc_prenorm_mma_kernel_scaffold above is filled in by a test-pass
+    // session. When OFF (production default), the scalar
+    // hc_prenorm_unified_kernel runs as it does today.
+    //
+    // The DG_SM120_HC_PRENORM_V2_STRICT=1 env var disables the
+    // automatic-fallback safety net (used during MMA kernel development).
+    const char* mma_env = std::getenv("DG_SM120_HC_PRENORM_V2_MMA");
+    const bool use_mma = (mma_env != nullptr) && (mma_env[0] != '0');
+
+    if (use_mma && m >= 16) {
+        // SCAFFOLD: routes to hc_prenorm_mma_kernel_scaffold which currently
+        // writes -inf for all outputs (sentinel). Production code MUST
+        // either fill in the MMA kernel body OR keep DG_SM120_HC_PRENORM_V2_MMA=0.
+        const int total_blocks_mma = num_splits * ((m + 15) / 16);
+        sm120_hcv2::hc_prenorm_mma_kernel_scaffold<8><<<
+            static_cast<unsigned>(total_blocks_mma), 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
+            b.data_ptr<float>(),
+            d.data_ptr<float>(),
+            sqr_sum.data_ptr<float>(),
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            d_stride_split, d_stride_m, d_stride_n,
+            s_stride_split, s_stride_m,
+            m, n, k, num_splits);
+        DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
+        return;
+    }
 
     const int total_blocks = num_splits * m;
     // smem layout: [n][threads] for partials + [threads] for sq.

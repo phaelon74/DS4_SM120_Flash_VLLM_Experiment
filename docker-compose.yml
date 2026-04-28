@@ -132,6 +132,20 @@ services:
         # the fast path is actually running on the live sparse indexer shape.
         # Default 0 to keep production logs clean.
         export DG_SM120_MQA_LOGITS_V2_TRACE="${DG_SM120_MQA_LOGITS_V2_TRACE:-0}"
+        # dsl12x Phase 1 trace: prints live sparse MLA prefill shape on the
+        # first 64 calls per process (seq_len, num_heads, qk_head_dim,
+        # v_head_dim, topk_width, dtype, has_attn_sink, kv_total_tokens).
+        # Used to confirm dsl12x kernel selects the correct shape-keyed
+        # variant in production. Default OFF; on by default in
+        # docker-compose.dsl12x.yml.
+        export DG_SM120_PREFILL_V2_TRACE="${DG_SM120_PREFILL_V2_TRACE:-0}"
+        # dsl12x prefill kernel opt-in. Default OFF in production. The
+        # docker-compose.dsl12x.yml sibling service flips this to 1.
+        export DG_SM120_DSL12X_PREFILL="${DG_SM120_DSL12X_PREFILL:-0}"
+        # If 1, an unsupported shape returned by the dsl12x prefill kernel
+        # raises an error instead of falling back to the BMM bridge. Use
+        # during development to catch silent shape fallbacks.
+        export DG_SM120_DSL12X_PREFILL_STRICT="${DG_SM120_DSL12X_PREFILL_STRICT:-0}"
         export DG_SM120_ENABLE_B12X_MOE="${DG_SM120_ENABLE_B12X_MOE:-0}"
         export DG_SM120_B12X_A1_GS="${DG_SM120_B12X_A1_GS:-1.0}"
         export DG_SM120_B12X_A2_GS="${DG_SM120_B12X_A2_GS:-1.0}"
@@ -279,6 +293,9 @@ services:
       DG_SM120_MQA_LOGITS_V2_MMA: "${DG_SM120_MQA_LOGITS_V2_MMA:-1}"
       DG_SM120_MQA_LOGITS_V2_STRICT: "${DG_SM120_MQA_LOGITS_V2_STRICT:-0}"
       DG_SM120_MQA_LOGITS_V2_TRACE: "${DG_SM120_MQA_LOGITS_V2_TRACE:-0}"
+      DG_SM120_PREFILL_V2_TRACE: "${DG_SM120_PREFILL_V2_TRACE:-0}"
+      DG_SM120_DSL12X_PREFILL: "${DG_SM120_DSL12X_PREFILL:-0}"
+      DG_SM120_DSL12X_PREFILL_STRICT: "${DG_SM120_DSL12X_PREFILL_STRICT:-0}"
       DG_SM120_ENABLE_B12X_MOE: "${DG_SM120_ENABLE_B12X_MOE:-0}"
       DG_SM120_B12X_A1_GS: "${DG_SM120_B12X_A1_GS:-1.0}"
       DG_SM120_B12X_A2_GS: "${DG_SM120_B12X_A2_GS:-1.0}"

@@ -1,0 +1,210 @@
+# dsl12x sibling docker-compose.
+#
+# Runs a SECOND vLLM instance side-by-side with the production service from
+# docker-compose.yml so we can A/B test the dsl12x sparse MLA prefill kernel
+# against the production BMM bridge without touching production.
+#
+# Differences from docker-compose.yml:
+#
+#   * service name = vllm-dsl12x (container name = vllm-deepseekv4-sm120-dsl12x)
+#   * host port    = 8081 (production stays on 8080)
+#   * Dockerfile   = Dockerfile.vllm-nightly-sm120-dsl12x (adds dsl12x cache
+#                    env vars; otherwise identical to production)
+#   * dsl12x env var defaults flipped ON:
+#       DG_SM120_DSL12X_PREFILL=1
+#       DG_SM120_PREFILL_V2_TRACE=1   (so we see live shape on first calls)
+#   * VLLM_GPU_MEMORY_UTILIZATION dropped slightly to leave headroom for the
+#     dsl12x JIT compile cache (cutlass.cute uses some host RAM at compile
+#     time but the GPU side is the same; we only drop GPU util a hair to
+#     give us margin if cold-start compile produces unexpected spikes).
+#
+# Workflow:
+#
+#   # Start production (port 8080):
+#   docker compose up -d vllm
+#
+#   # Stop production, start dsl12x (port 8081):
+#   docker compose down vllm
+#   docker compose -f docker-compose.dsl12x.yml up -d vllm-dsl12x
+#
+#   # Once dsl12x is proven, bring production back with DSL12X_PREFILL=1
+#   # baked into docker-compose.yml.
+#
+# VRAM:
+#
+#   DeepSeek V4 Flash needs ~80 GB FP8 weights + KV cache headroom. On 2x
+#   RTX PRO 6000 96 GB or 4x RTX PRO 6000 96 GB (current production uses
+#   tp=4) we can fit ONE serving instance at a time, NOT both side-by-side.
+#   Use the docker compose down/up dance above to switch.
+#
+# IPC and shm_size:
+#
+#   Inherited from docker-compose.yml. Separate IPC namespace ensures a
+#   dsl12x crash cannot signal/dump-core into the production container.
+
+services:
+  vllm-dsl12x:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm-nightly-sm120-dsl12x
+    image: vllm-deepseekv4-sm120-dsl12x:latest
+    container_name: vllm-deepseekv4-sm120-dsl12x
+    entrypoint: /bin/bash
+    command:
+      - -lc
+      - |
+        set -euo pipefail
+        cd /workspace/DeepGEMM
+        DG_FORCE_BUILD=0 CUDA_HOME=/usr/local/cuda python3 -m pip install -e . --no-build-isolation
+        python3 docker/patch_vllm_deepseekv4.py
+        export VLLM_USE_DEEP_GEMM=1
+        export VLLM_USE_DEEP_GEMM_E8M0=1
+        export VLLM_ENGINE_READY_TIMEOUT_S=3600
+        export VLLM_RPC_TIMEOUT=600000
+        export TILELANG_CLEANUP_TEMP_FILES=1
+        export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+        # All DG_SM120_* env vars from production stay at their production
+        # defaults; only the dsl12x-specific ones are flipped on. This keeps
+        # the dsl12x container behaviorally identical to production EXCEPT
+        # for the new prefill path. Trace is on so we capture live shape on
+        # the first 64 calls per process, which feeds into kernel tuning.
+        export DG_SM120_DSL12X_PREFILL="${DG_SM120_DSL12X_PREFILL:-1}"
+        export DG_SM120_DSL12X_PREFILL_STRICT="${DG_SM120_DSL12X_PREFILL_STRICT:-0}"
+        export DG_SM120_PREFILL_V2_TRACE="${DG_SM120_PREFILL_V2_TRACE:-1}"
+        export DG_SM120_DSL12X_DECODE="${DG_SM120_DSL12X_DECODE:-0}"
+        export DG_SM120_DSL12X_INDEXER="${DG_SM120_DSL12X_INDEXER:-0}"
+        # Re-export everything else from production. Source the same
+        # environment block as docker-compose.yml. We avoid copy-paste here
+        # by relying on the fact that docker-compose.yml's env vars are
+        # already in our environment via the `environment:` block below.
+        export DG_SM120_SKIP_PADDED_ZERO=1
+        export DG_SM120_FP4_COLS_PER_BLOCK=8
+        export DG_SM120_FULL_CONTEXT_BF16_BMM=1
+        export DG_SM120_INDEXED_BF16_BMM=1
+        export DG_SM120_WORKSPACE_FUSED_ATTENTION=1
+        export DG_SM120_WORKSPACE_SPLIT_ATTENTION="${DG_SM120_WORKSPACE_SPLIT_ATTENTION:-1}"
+        export DG_SM120_PREFILL_TORCH_BMM="${DG_SM120_PREFILL_TORCH_BMM:-1}"
+        export DG_SM120_PREFILL_TRUST_INDICES="${DG_SM120_PREFILL_TRUST_INDICES:-1}"
+        export DG_SM120_PREFILL_WORKSPACE_CHUNK="${DG_SM120_PREFILL_WORKSPACE_CHUNK:-256}"
+        export DG_SM120_ACTIVE_HEADS="${DG_SM120_ACTIVE_HEADS:-32}"
+        export DG_SM120_MAIN_TOPK_CAP="${DG_SM120_MAIN_TOPK_CAP:-128}"
+        export DG_SM120_HC_PRENORM_V2="${DG_SM120_HC_PRENORM_V2:-1}"
+        export DG_SM120_MQA_LOGITS_V2_MMA="${DG_SM120_MQA_LOGITS_V2_MMA:-1}"
+        export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
+        export DSL12X_CUTE_COMPILE_CACHE_DIR="${DSL12X_CUTE_COMPILE_CACHE_DIR:-/tmp/dsl12x_cute_cache}"
+        export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-131072}"
+        export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}"
+        export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-4}"
+        export VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE="${VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
+        export VLLM_PERFORMANCE_MODE="${VLLM_PERFORMANCE_MODE:-balanced}"
+        export VLLM_OPTIMIZATION_LEVEL="${VLLM_OPTIMIZATION_LEVEL:-2}"
+        # Slight VRAM-util drop from production's 0.980 -> 0.970 to leave
+        # margin for dsl12x JIT compile spikes during warmup.
+        export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.970}"
+        export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
+        export VLLM_KV_CACHE_MEMORY_BYTES="${VLLM_KV_CACHE_MEMORY_BYTES:-8589934592}"
+        export VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
+        set --
+        case "$(printenv VLLM_ENFORCE_EAGER)" in
+          1|true|TRUE|yes|YES|on|ON)
+            set -- "$@" --enforce-eager
+            ;;
+        esac
+        if [[ -n "$(printenv VLLM_KV_CACHE_MEMORY_BYTES)" ]]; then
+          set -- "$@" --kv-cache-memory-bytes "$(printenv VLLM_KV_CACHE_MEMORY_BYTES)"
+        fi
+        if [[ -n "$(printenv VLLM_SPECULATIVE_CONFIG_FILE)" ]]; then
+          set -- "$@" --speculative-config "$(cat "$(printenv VLLM_SPECULATIVE_CONFIG_FILE)")"
+        elif [[ -n "$(printenv VLLM_SPECULATIVE_CONFIG_JSON)" ]]; then
+          set -- "$@" --speculative-config "$(printenv VLLM_SPECULATIVE_CONFIG_JSON)"
+        fi
+        export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+        exec vllm serve "$(printenv MODEL_PATH)" \
+          --served-model-name "$(printenv MODEL_NAME)" \
+          --trust-remote-code \
+          --attention-backend FLASHMLA_SPARSE \
+          --moe-backend deep_gemm \
+          --kv-cache-dtype fp8_ds_mla \
+          --block-size 256 \
+          --enable-expert-parallel \
+          -tp 4 \
+          --tokenizer-mode deepseek_v4 \
+          --tool-call-parser deepseek_v4 \
+          --enable-auto-tool-choice \
+          --reasoning-parser deepseek_v4 \
+          --max-model-len "$(printenv VLLM_MAX_MODEL_LEN)" \
+          --max-num-batched-tokens "$(printenv VLLM_MAX_NUM_BATCHED_TOKENS)" \
+          --max-num-seqs "$(printenv VLLM_MAX_NUM_SEQS)" \
+          --max-num-partial-prefills 1 \
+          --max-long-partial-prefills 1 \
+          --enable-chunked-prefill \
+          --optimization-level "$(printenv VLLM_OPTIMIZATION_LEVEL)" \
+          --performance-mode "$(printenv VLLM_PERFORMANCE_MODE)" \
+          --max-cudagraph-capture-size "$(printenv VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE)" \
+          --gpu-memory-utilization "$(printenv VLLM_GPU_MEMORY_UTILIZATION)" \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --disable-uvicorn-access-log \
+          $(printenv VLLM_EXTRA_ARGS) \
+          "$@"
+    ipc: host
+    shm_size: 32gb
+    init: true
+    ports:
+      - "8081:8000"
+    environment:
+      MODEL_PATH: "${MODEL_PATH:-/models/deepseek-v4-flash}"
+      MODEL_NAME: "${MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash}"
+      CUDA_VISIBLE_DEVICES: "0,1,2,3"
+      CUDA_HOME: /usr/local/cuda
+      TORCH_CUDA_ARCH_LIST: "12.0"
+      VLLM_TARGET_DEVICE: cuda
+      # The dsl12x-specific env vars: PREFILL on, decode/indexer off
+      # (decode + indexer are scaffold-only this session, so flipping their
+      # env vars on without an MMA inner would just trigger
+      # NotImplementedError on every kernel call). TRACE on captures live
+      # shape on first 64 calls per process for kernel tuning.
+      DG_SM120_DSL12X_PREFILL: "${DG_SM120_DSL12X_PREFILL:-1}"
+      DG_SM120_DSL12X_PREFILL_STRICT: "${DG_SM120_DSL12X_PREFILL_STRICT:-0}"
+      DG_SM120_PREFILL_V2_TRACE: "${DG_SM120_PREFILL_V2_TRACE:-1}"
+      DG_SM120_DSL12X_DECODE: "${DG_SM120_DSL12X_DECODE:-0}"
+      DG_SM120_DSL12X_INDEXER: "${DG_SM120_DSL12X_INDEXER:-0}"
+      DG_SM120_HC_PRENORM_TRACE: "${DG_SM120_HC_PRENORM_TRACE:-1}"
+      # Production env vars that affect production prefill behavior; dsl12x
+      # uses these as a fallback path when the dsl12x kernel can't handle
+      # a particular shape (try/except in the patcher branch).
+      DG_SM120_PREFILL_WORKSPACE_CHUNK: "${DG_SM120_PREFILL_WORKSPACE_CHUNK:-256}"
+      DG_SM120_PREFILL_TORCH_BMM: "${DG_SM120_PREFILL_TORCH_BMM:-1}"
+      DG_SM120_PREFILL_TRUST_INDICES: "${DG_SM120_PREFILL_TRUST_INDICES:-1}"
+      DG_SM120_ACTIVE_HEADS: "32"
+      DG_SM120_MAIN_TOPK_CAP: "${DG_SM120_MAIN_TOPK_CAP:-128}"
+      DG_SM120_HC_PRENORM_V2: "${DG_SM120_HC_PRENORM_V2:-1}"
+      DG_SM120_MQA_LOGITS_V2_MMA: "${DG_SM120_MQA_LOGITS_V2_MMA:-1}"
+      CUTE_DSL_ARCH: "${CUTE_DSL_ARCH:-sm_120a}"
+      B12X_CUTE_COMPILE_CACHE_DIR: "${B12X_CUTE_COMPILE_CACHE_DIR:-/tmp/b12x_cute_cache}"
+      DSL12X_CUTE_COMPILE_CACHE_DIR: "${DSL12X_CUTE_COMPILE_CACHE_DIR:-/tmp/dsl12x_cute_cache}"
+      VLLM_MAX_MODEL_LEN: "${VLLM_MAX_MODEL_LEN:-131072}"
+      VLLM_MAX_NUM_BATCHED_TOKENS: "${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}"
+      VLLM_MAX_NUM_SEQS: "${VLLM_MAX_NUM_SEQS:-4}"
+      VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE: "${VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE:-8}"
+      VLLM_PERFORMANCE_MODE: "${VLLM_PERFORMANCE_MODE:-balanced}"
+      VLLM_OPTIMIZATION_LEVEL: "${VLLM_OPTIMIZATION_LEVEL:-2}"
+      VLLM_GPU_MEMORY_UTILIZATION: "${VLLM_GPU_MEMORY_UTILIZATION:-0.970}"
+      VLLM_ENFORCE_EAGER: "${VLLM_ENFORCE_EAGER:-0}"
+      VLLM_KV_CACHE_MEMORY_BYTES: "${VLLM_KV_CACHE_MEMORY_BYTES:-8589934592}"
+      VLLM_SPECULATIVE_CONFIG_FILE: "${VLLM_SPECULATIVE_CONFIG_FILE:-/workspace/DeepGEMM/docker/vllm_speculative_mtp1_local_argmax.json}"
+      VLLM_EXTRA_ARGS: "${VLLM_EXTRA_ARGS:-}"
+      MAX_JOBS: "${MAX_JOBS:-40}"
+    volumes:
+      - .:/workspace/DeepGEMM
+      - ./vllm_src:/workspace/vllm
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${HOME}/.cache/pip:/root/.cache/pip
+      - ${MODEL_LOCAL_DIR:-/media/fmodels/deepseek-ai/DeepSeek-V4-Flash}:/models/deepseek-v4-flash:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1", "2", "3"]
+              capabilities: [gpu]

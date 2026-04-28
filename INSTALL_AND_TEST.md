@@ -395,10 +395,165 @@ are deliberately bind-mounted so model weights survive across runs.
 
 ---
 
+## 11. dsl12x sibling container (CuTe DSL kernels, off by default in production)
+
+`dsl12x/` is a new standalone CuTe DSL kernel library targeting DeepSeek V4
+Flash on SM120. It ships as a SCAFFOLD in this initial release — the
+sparse-MLA-prefill kernel structure is in place, but the MMA inner has
+explicit `XXX(MMA-INNER)` markers that need to be filled in by a follow-up
+session. See `dsl12x/README.md` for the full architecture, what's real vs
+scaffold, and the roadmap.
+
+The dsl12x prefill path is opt-in via `DG_SM120_DSL12X_PREFILL=1`.
+Production `docker-compose.yml` keeps it OFF; the sibling
+`docker-compose.dsl12x.yml` flips it ON for safe A/B testing on host port
+8081 (production stays untouched on 8080).
+
+### Smoke test (validates cutlass.cute toolchain on the host)
+
+```bash
+docker compose exec -T vllm bash -lc 'cd /workspace/DeepGEMM && python3 scripts/test_dsl12x_smoke.py'
+```
+
+Expected output:
+```
+dsl12x smoke test on NVIDIA RTX PRO 6000 (compute (12, 0))
+hello_mma correctness: max_diff=...
+PASS: hello_mma output matches PyTorch reference
+hello_mma JIT cache: first=... ms, replay=... ms, cache_size=1
+PASS: cache hit on replay
+
+ALL PASS: dsl12x toolchain is operational on this system.
+```
+
+If the smoke test fails, no production dsl12x kernel will work either —
+fix the toolchain (most likely
+`pip install --force-reinstall nvidia-cutlass-dsl-libs-cu13==4.4.2`)
+before continuing.
+
+### Capture live shape with the trace hook (production-safe)
+
+```bash
+docker compose down vllm
+DG_SM120_PREFILL_V2_TRACE=1 docker compose up -d vllm
+# Wait for service ready, then send a benchmark request:
+BASE_URL=http://127.0.0.1:8080 MAX_TOKENS=32 CONCURRENCY=1 scripts/bench_deepseek_v4_flash_api.sh
+# Read the trace from logs:
+docker compose logs vllm 2>&1 | grep sm120_prefill_v2_trace
+```
+
+Use the printed `seq_len, num_heads, qk_head_dim, v_head_dim, topk_width,
+kv_total_tokens` values to construct the `SparseMLATraits` for the dsl12x
+warmup call.
+
+### Bring up the dsl12x sibling
+
+VRAM constraint: only ONE serving instance can run at a time on a 4x RTX
+PRO 6000 96 GB host. Stop production first.
+
+```bash
+docker compose down vllm
+docker compose -f docker-compose.dsl12x.yml up -d vllm-dsl12x
+
+# Wait for service ready (it patches vLLM and JIT-builds the extension on
+# first run; takes 1-2 minutes):
+while ! curl -sf http://127.0.0.1:8081/health > /dev/null 2>&1; do sleep 5; done
+
+# Tiny correctness check on the dsl12x sibling:
+curl -sS http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-ai/DeepSeek-V4-Flash","messages":[{"role":"user","content":"Reply exactly OK."}],"max_tokens":8,"temperature":0}'
+```
+
+When the dsl12x kernel scaffold is hit, the patcher's try/except catches
+the `NotImplementedError` and falls through to the BMM bridge, so the
+sibling correctness should still return `OK.`. Once the kernel inner is
+filled in, this same call exercises the dsl12x kernel for real.
+
+### Run dsl12x correctness + bench (synthetic, off-line)
+
+```bash
+docker compose exec -T vllm-dsl12x bash -lc 'cd /workspace/DeepGEMM && python3 scripts/test_dsl12x_sparse_prefill.py --num-tokens 32 --num-heads 32 --qk-head-dim 576 --v-head-dim 512 --topk 128'
+```
+
+Exit codes:
+- `0`: kernel compiled, ran, output matches scalar reference within
+  tolerance.
+- `1`: kernel compiled and ran but output is wrong.
+- `2`: kernel is still scaffold (NotImplementedError raised). Fill in the
+  MMA inner; see `dsl12x/README.md` roadmap.
+- `3`: environment error (no CUDA, not SM120, no cutlass.cute).
+
+```bash
+docker compose exec -T vllm-dsl12x bash -lc 'cd /workspace/DeepGEMM && python3 scripts/bench_dsl12x_sparse_prefill.py --num-tokens 256 --num-heads 32 --qk-head-dim 576 --v-head-dim 512 --topk 128 --kv-rows 16384 --has-attn-sink --warmup 5 --iters 50'
+```
+
+Reports cold-start (includes JIT compile) and steady-state (median over
+N iters) for dsl12x vs the BMM bridge vs the scalar reference.
+
+### Switching back to production
+
+```bash
+docker compose -f docker-compose.dsl12x.yml down vllm-dsl12x
+docker compose up -d vllm
+```
+
+---
+
+## 12. mHC MMA path (Phase 5, raw CUDA)
+
+The mHC HyperConnection prenorm has its own (separate from dsl12x) MMA
+upgrade path. Same scaffold approach: PTX inline-asm helper +
+scaffolded kernel + env-var gate that defaults OFF.
+
+### Trace live mHC shape
+
+```bash
+DG_SM120_HC_PRENORM_TRACE=1 docker compose up -d vllm
+# Run bench, then:
+docker compose logs vllm 2>&1 | grep sm120_hc_prenorm_trace
+```
+
+### Test the MMA path scaffold
+
+```bash
+docker compose exec -T vllm bash -lc 'cd /workspace/DeepGEMM && DG_SM120_HC_PRENORM_V2_MMA=1 python3 -m pytest tests/test_hyperconnection.py::test_hc_prenorm_gemm_mma_path_sm120 -v'
+```
+
+Currently the test detects the scaffold sentinel and skips with a clear
+message. Set `DG_SM120_HC_PRENORM_V2_MMA_STRICT=1` to make scaffold
+detection a hard fail (use during MMA kernel implementation).
+
+### Bench the mHC MMA path
+
+```bash
+docker compose exec -T vllm bash -lc 'cd /workspace/DeepGEMM && python3 scripts/bench_sm120_hc_prenorm.py --m 64 --n 32 --k 7168'
+```
+
+Reports v2-scalar vs v2-MMA vs v1-fallback. v2-MMA currently shows the
+scaffold sentinel; once the kernel inner is filled in this comparison
+will be the perf signal for the MMA path.
+
+---
+
 ## Reference of files added / changed for this milestone
 
 | File                                                       | Status   | Purpose                                              |
 | ---------------------------------------------------------- | -------- | ---------------------------------------------------- |
+| `dsl12x/`                                                  | NEW      | Standalone CuTe DSL kernel library scaffold          |
+| `dsl12x/__init__.py`, `runtime.py`, `ptx.py`, `smem.py`, `jit_cache.py` | NEW | Package + helpers + LRU JIT cache              |
+| `dsl12x/hello_mma/kernel.py`                               | NEW      | Toolchain validation kernel                          |
+| `dsl12x/attention/traits.py`                               | NEW      | SparseMLATraits + workspace map encoding             |
+| `dsl12x/attention/prefill_kernel.py`                       | NEW      | SCAFFOLD: sparse MLA prefill kernel                  |
+| `dsl12x/attention/prefill.py`                              | NEW      | Host wrapper + warmup                                |
+| `dsl12x/attention/{decode,indexer}_kernel.py`              | NEW      | SCAFFOLD: decode + indexer kernels                   |
+| `dsl12x/attention/{decode,indexer}.py`                     | NEW      | Host wrappers (NotImplementedError until inner)      |
+| `dsl12x/README.md`                                         | NEW      | Architecture + scaffold-vs-real status               |
+| `Dockerfile.vllm-nightly-sm120-dsl12x`                     | NEW      | Sibling vLLM image (port 8081)                       |
+| `docker-compose.dsl12x.yml`                                | NEW      | Sibling vllm-dsl12x service                          |
+| `scripts/test_dsl12x_smoke.py`                             | NEW      | Toolchain smoke test runner                          |
+| `scripts/test_dsl12x_sparse_prefill.py`                    | NEW      | dsl12x correctness vs scalar                         |
+| `scripts/bench_dsl12x_sparse_prefill.py`                   | NEW      | dsl12x vs BMM vs scalar perf                         |
 | `csrc/sm120_tf32_hc_prenorm_gemm.cu`                       | NEW      | Tiled HC prenorm v2 (Phase 1.1)                      |
 | `csrc/jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp`    | NEW      | Header for above                                     |
 | `csrc/sm120_sparse_mla_decode_v2.cu`                       | NEW      | Fused sparse MLA decode v2 (Phase 2)                 |
