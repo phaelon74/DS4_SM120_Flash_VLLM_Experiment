@@ -139,6 +139,17 @@ services:
         # variant in production. Default OFF; on by default in
         # docker-compose.dsl12x.yml.
         export DG_SM120_PREFILL_V2_TRACE="${DG_SM120_PREFILL_V2_TRACE:-0}"
+        # mHC prenorm GEMM trace hook: prints live mHC GEMM shape (M, N, K,
+        # num_splits, dtype, dispatch path) for the first 64 calls per
+        # process. Used to size the SM120 mHC MMA replacement kernel for
+        # the actual production shape distribution. Default OFF; flip to 1
+        # via host env to capture, then turn back off.
+        export DG_SM120_HC_PRENORM_TRACE="${DG_SM120_HC_PRENORM_TRACE:-0}"
+        # mHC v2 MMA path (raw CUDA TF32 m16n8k8). Currently a scaffold
+        # that writes -INFINITY as a sentinel; will be filled in once the
+        # trace data is available. Default OFF in production.
+        export DG_SM120_HC_PRENORM_V2_MMA="${DG_SM120_HC_PRENORM_V2_MMA:-0}"
+        export DG_SM120_HC_PRENORM_V2_STRICT="${DG_SM120_HC_PRENORM_V2_STRICT:-0}"
         # dsl12x prefill kernel opt-in. Default OFF in production. The
         # docker-compose.dsl12x.yml sibling service flips this to 1.
         export DG_SM120_DSL12X_PREFILL="${DG_SM120_DSL12X_PREFILL:-0}"
@@ -294,6 +305,9 @@ services:
       DG_SM120_MQA_LOGITS_V2_STRICT: "${DG_SM120_MQA_LOGITS_V2_STRICT:-0}"
       DG_SM120_MQA_LOGITS_V2_TRACE: "${DG_SM120_MQA_LOGITS_V2_TRACE:-0}"
       DG_SM120_PREFILL_V2_TRACE: "${DG_SM120_PREFILL_V2_TRACE:-0}"
+      DG_SM120_HC_PRENORM_TRACE: "${DG_SM120_HC_PRENORM_TRACE:-0}"
+      DG_SM120_HC_PRENORM_V2_MMA: "${DG_SM120_HC_PRENORM_V2_MMA:-0}"
+      DG_SM120_HC_PRENORM_V2_STRICT: "${DG_SM120_HC_PRENORM_V2_STRICT:-0}"
       DG_SM120_DSL12X_PREFILL: "${DG_SM120_DSL12X_PREFILL:-0}"
       DG_SM120_DSL12X_PREFILL_STRICT: "${DG_SM120_DSL12X_PREFILL_STRICT:-0}"
       DG_SM120_ENABLE_B12X_MOE: "${DG_SM120_ENABLE_B12X_MOE:-0}"
