@@ -305,15 +305,21 @@ fp8_mqa_logits_v2_mma_kernel(
     __syncthreads();
 
     // Lane -> SMEM addressing for the A operand (Q tile [M=16, K=16] BF16,
-    // ldmatrix.x4.m8n8). Convention (matches the existing native FP8 path):
-    //   matrix_idx = lane / 8  -> 0..3 selects which 8x8 sub-tile
-    //   row_within = lane % 8
-    //   m  = (matrix_idx >> 1) * 8 + row_within
-    //   ko = (matrix_idx & 1) * 8        (K offset within the K=16 chunk)
-    const int q_matrix_idx = lane >> 3;
-    const int q_row_within = lane & 7;
-    const int q_m = (q_matrix_idx >> 1) * 8 + q_row_within;
-    const int q_k_off = (q_matrix_idx & 1) * 8;
+    // ldmatrix.x4.m8n8). Mirrors the validated formula from the native FP8
+    // decode kernel (csrc/sm120_sparse_mla_decode_v2_native.cu:526-527):
+    //   q_m     = lane & 15        // M-row, wraps at lane 16
+    //   q_k_off = 8 * (lane >> 4)  // K offset within the K=16 chunk (0 or 8)
+    //
+    // The four 8x8 sub-matrices of A as ordered by the m16n8k16 hardware:
+    //   matrix 0 (lanes 0-7)   : M=0..7,  K=0..7
+    //   matrix 1 (lanes 8-15)  : M=8..15, K=0..7
+    //   matrix 2 (lanes 16-23) : M=0..7,  K=8..15
+    //   matrix 3 (lanes 24-31) : M=8..15, K=8..15
+    // (i.e. bit 0 of matrix_idx selects the M-half, bit 1 selects the K-half;
+    // the earlier C2a draft had these two bits swapped, scrambling matrices
+    // 1 and 2 and producing max_diff ~10 with mask_match=True.)
+    const int q_m = lane & 15;
+    const int q_k_off = 8 * (lane >> 4);
 
     // Lane -> SMEM addressing for the B operand (K tile [N=8 rows, K=16 cols]
     // in N-major layout, loaded with ldmatrix.x2.trans). For x2 each lane in
