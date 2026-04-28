@@ -37,8 +37,19 @@ Exit codes:
 
 from __future__ import annotations
 
+import os
 import sys
 import inspect
+
+# Bootstrap the workspace root (parent of scripts/) onto sys.path so any
+# follow-up `dsl12x` import works the same way as test_dsl12x_smoke.py.
+# (This script does not import dsl12x today, but the bootstrap is cheap and
+# matches the project convention.)
+_WORKSPACE_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)
+)
+if _WORKSPACE_ROOT not in sys.path:
+    sys.path.insert(0, _WORKSPACE_ROOT)
 
 
 def _hr(title: str) -> None:

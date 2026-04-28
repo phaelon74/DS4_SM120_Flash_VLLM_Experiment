@@ -33,7 +33,16 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
+
+# Bootstrap the workspace root (parent of scripts/) onto sys.path so the
+# `dsl12x` package is importable regardless of where this script is run from.
+_WORKSPACE_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)
+)
+if _WORKSPACE_ROOT not in sys.path:
+    sys.path.insert(0, _WORKSPACE_ROOT)
 
 import torch
 
