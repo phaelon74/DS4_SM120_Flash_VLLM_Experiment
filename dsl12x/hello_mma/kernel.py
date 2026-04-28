@@ -77,9 +77,10 @@ def _build_kernel():
         # Cooperative scalar copy gmem -> smem. 32 threads / 256 BF16 = 8/thread for A,
         # 32 threads / 128 BF16 = 4/thread for B. Use the raw pointers (flat 1D) for
         # the move; we'll wrap them in a 2D layout for the MMA partitioning below.
-        for i in cute.range_constexpr(8):
+        # NOTE: range_constexpr lives on `cutlass`, not on `cutlass.cute`.
+        for i in cutlass.range_constexpr(8):
             smem_a_ptr[tid * 8 + i] = a_gmem_ptr[tid * 8 + i]
-        for i in cute.range_constexpr(4):
+        for i in cutlass.range_constexpr(4):
             smem_b_ptr[tid * 4 + i] = b_gmem_ptr[tid * 4 + i]
         cute.arch.sync_threads()
 
@@ -127,7 +128,7 @@ def _build_kernel():
 
         # Zero the accumulator. The fragment is small (4 FP32 per thread for
         # m16n8k16) so a constexpr loop is fine.
-        for i in cute.range_constexpr(4):
+        for i in cutlass.range_constexpr(4):
             rC[i] = Float32(0.0)
 
         # Execute the MMA: rC = rA * rB + rC.
