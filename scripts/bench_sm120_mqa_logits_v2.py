@@ -169,7 +169,7 @@ def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device,
         seq_len=inputs["seq_len"], seq_len_kv=inputs["seq_len_kv"],
         device=device, dtype=dtype,
     )
-    env_value = "1" if path == "mma" else None
+    env_value = "1" if path == "mma" else "0"
     with _env_var("DG_SM120_MQA_LOGITS_V2_MMA", env_value):
         _C.sm120_fp8_mqa_logits_v2(
             q=inputs["q"], kv=inputs["kv"], kv_sf=inputs["kv_sf"],

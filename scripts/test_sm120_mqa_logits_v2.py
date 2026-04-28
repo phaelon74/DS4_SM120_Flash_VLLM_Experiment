@@ -6,6 +6,9 @@
 # Two inner paths are exercised by default:
 #
 #   * "scalar" (C1):  bit-exact to deep_gemm::sm120_fallback::mqa_logits_kernel.
+#                     Selected by setting DG_SM120_MQA_LOGITS_V2_MMA=0 around
+#                     the call (the v2 entry point is default-on for MMA after
+#                     C3, so we must explicitly opt out here to test scalar).
 #   * "mma"    (C2a): BF16 m16n8k16 mma.sync tensor-core path. Selected by
 #                     setting DG_SM120_MQA_LOGITS_V2_MMA=1 around the call.
 #
@@ -240,8 +243,13 @@ def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device,
              path: str = "scalar"):
     """Call the v2 entry point with the inner selected by ``path``.
 
-    path = "scalar"  ->  unset DG_SM120_MQA_LOGITS_V2_MMA (C1 scalar inner)
-    path = "mma"     ->  set DG_SM120_MQA_LOGITS_V2_MMA=1 (C2a MMA inner)
+    path = "scalar"  ->  set DG_SM120_MQA_LOGITS_V2_MMA=0 (C1 scalar inner).
+                         Required because the v2 entry point is default-on for
+                         MMA after C3; an unset env now selects MMA, so we
+                         must explicitly opt out to exercise the scalar inner.
+    path = "mma"     ->  set DG_SM120_MQA_LOGITS_V2_MMA=1 (C2a MMA inner).
+                         Equivalent to leaving the env unset post-C3, but
+                         explicit makes the test self-documenting.
     """
     if path not in ("scalar", "mma"):
         raise ValueError(f"path must be 'scalar' or 'mma', got {path!r}")
@@ -252,7 +260,7 @@ def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device,
         device=device,
         dtype=dtype,
     )
-    env_value = "1" if path == "mma" else None
+    env_value = "1" if path == "mma" else "0"
     with _env_var("DG_SM120_MQA_LOGITS_V2_MMA", env_value):
         _C.sm120_fp8_mqa_logits_v2(
             q=inputs["q"],

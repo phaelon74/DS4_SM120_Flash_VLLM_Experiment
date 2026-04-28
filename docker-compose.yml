@@ -110,6 +110,22 @@ services:
         # SM120 HC prenorm v2: tiled unified-kernel replacement for the scalar
         # fallback. Default-on; safe to leave enabled across all N <= 64.
         export DG_SM120_HC_PRENORM_V2="${DG_SM120_HC_PRENORM_V2:-1}"
+        # SM120 MQA logits v2 (FP8 non-paged): BF16 m16n8k16 mma.sync tensor-core
+        # replacement for sm120_fp8_mqa_logits_fallback. The apis dispatch in
+        # csrc/apis/attention.hpp now routes the SM120 fp8 (non-paged) case to
+        # this v2 entry. Set to 0 to force the bit-exact scalar inner (e.g. for
+        # A/B comparison or to debug a regression). Synthetic correctness PASS
+        # against torch ref + apis fallback (FP32 max_diff < 5e-3, BF16 max_rel
+        # < 8e-3); 33x faster than the scalar inner at S=16k (10.97 ms vs
+        # 365 ms; 706 us at S=4k). Targets the dominant prefill bottleneck
+        # (~76% of TTFT at 16k uncached prompt before C3).
+        export DG_SM120_MQA_LOGITS_V2_MMA="${DG_SM120_MQA_LOGITS_V2_MMA:-1}"
+        # If 1, an unsupported shape returned by the v2 MMA path raises a host
+        # error instead of silently falling back to the scalar inner. Use during
+        # development to catch silent shape fallbacks; leave 0 in production so
+        # any shape outside the v2 MMA window (head_dim != 64, num_heads > 64,
+        # or non-FP32/BF16 logits dtype) still produces a correct result.
+        export DG_SM120_MQA_LOGITS_V2_STRICT="${DG_SM120_MQA_LOGITS_V2_STRICT:-0}"
         export DG_SM120_ENABLE_B12X_MOE="${DG_SM120_ENABLE_B12X_MOE:-0}"
         export DG_SM120_B12X_A1_GS="${DG_SM120_B12X_A1_GS:-1.0}"
         export DG_SM120_B12X_A2_GS="${DG_SM120_B12X_A2_GS:-1.0}"
@@ -254,6 +270,8 @@ services:
       DG_SM120_FUSED_PREFILL_V2: "${DG_SM120_FUSED_PREFILL_V2:-0}"
       DG_SM120_FUSED_PREFILL_V2_STRICT: "${DG_SM120_FUSED_PREFILL_V2_STRICT:-0}"
       DG_SM120_HC_PRENORM_V2: "${DG_SM120_HC_PRENORM_V2:-1}"
+      DG_SM120_MQA_LOGITS_V2_MMA: "${DG_SM120_MQA_LOGITS_V2_MMA:-1}"
+      DG_SM120_MQA_LOGITS_V2_STRICT: "${DG_SM120_MQA_LOGITS_V2_STRICT:-0}"
       DG_SM120_ENABLE_B12X_MOE: "${DG_SM120_ENABLE_B12X_MOE:-0}"
       DG_SM120_B12X_A1_GS: "${DG_SM120_B12X_A1_GS:-1.0}"
       DG_SM120_B12X_A2_GS: "${DG_SM120_B12X_A2_GS:-1.0}"

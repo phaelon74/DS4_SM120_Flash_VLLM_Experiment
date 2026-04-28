@@ -1,20 +1,37 @@
 // SM120 MQA logits v2 (FP8 non-paged).
 //
-// C1: this scaffold implemented the v2 entry point with a scalar inner that
-// is bit-exact to ``deep_gemm::sm120_fallback::mqa_logits_kernel``. C2a
-// adds a BF16 m16n8k16 tensor-core path (``sm120_mqa_logits_v2_mma.cu``);
-// the host launcher below dispatches to it when ``DG_SM120_MQA_LOGITS_V2_MMA=1``
-// is set in the environment. The MMA path is opt-in for C2a so that we can
-// land it, validate correctness in isolation, and microbench it before
-// promoting to default-on (and live wire-up) in C3.
+// History:
+//   C1:  scaffold with scalar inner, bit-exact to
+//        ``deep_gemm::sm120_fallback::mqa_logits_kernel``.
+//   C2a: BF16 m16n8k16 mma.sync tensor-core path
+//        (``csrc/sm120_mqa_logits_v2_mma.cu``). Synthetic correctness PASSes
+//        against both torch ref and the apis fallback (FP32 max_diff < 5e-3,
+//        BF16 max_rel < 8e-3); 33x faster than the scalar inner at S=16k
+//        (10.97 ms vs 365 ms; 706 us at S=4k).
+//   C3:  apis dispatch wired to call this v2 entry point on SM120 instead
+//        of ``sm120_fp8_mqa_logits_fallback`` (see ``csrc/apis/attention.hpp``).
+//        The MMA inner is now ON by default in this entry point; the env
+//        var ``DG_SM120_MQA_LOGITS_V2_MMA=0`` disables it (forces the scalar
+//        inner) for debugging or A/B comparison.
 //
-// Profile attribution (live torch trace, single request, rank 0):
+// Env vars consumed:
+//   DG_SM120_MQA_LOGITS_V2_MMA
+//       Default ON. Set to 0/false/no to force the scalar inner. Set to any
+//       other value (or leave unset) to use the MMA inner.
+//   DG_SM120_MQA_LOGITS_V2_STRICT
+//       Default OFF. When set to 1/true/yes, an unsupported shape returned
+//       by the MMA path raises a hard error instead of silently falling
+//       back to scalar. Use during development to catch silent shape
+//       fallbacks; leave OFF for production serving so unsupported shapes
+//       (e.g. ``head_dim != 64``) still produce correct results.
+//
+// Profile attribution (live torch trace, single request, rank 0; recorded
+// before C3 wire-up):
 //   prompt 4k:   961.557 ms /  42 calls  (44% of 2.18s TTFT)
 //   prompt 8k:  3646.926 ms /  63 calls  (62% of 5.87s TTFT)
 //   prompt 16k: 13962.641 ms / 105 calls (76% of 18.44s TTFT)
-// At the 16k size the existing scalar averages ~133 ms / call; the MMA
-// path's theoretical floor (BF16 tensor-core at ~30% of peak) is well
-// under 200 us / call.
+// Synthetic kernel-level cost after C2a (S=16k single call): 11 ms. Live
+// numbers will be captured into AGENTS.md after the C3 restart.
 
 #include <algorithm>
 #include <cstdlib>
@@ -45,9 +62,9 @@ __device__ __forceinline__ void store_logit<__nv_bfloat16>(
 }
 
 // Scalar inner identical to ``sm120_fallback::mqa_logits_kernel<out_t,false>``.
-// C2 will replace the body below the ``--- C2 MMA REPLACEMENT ABOVE ---``
-// marker with a BF16 m16n8k16 mma.sync implementation while keeping this
-// host-side launch path unchanged.
+// Retained after C3 as the correctness fallback for shapes the MMA path
+// (``csrc/sm120_mqa_logits_v2_mma.cu``) does not support, and as the inner
+// selected when ``DG_SM120_MQA_LOGITS_V2_MMA=0``.
 template <typename out_t>
 __global__ void fp8_mqa_logits_v2_scalar_kernel(
     const __nv_fp8_e4m3* __restrict__ q,
@@ -93,8 +110,6 @@ __global__ void fp8_mqa_logits_v2_scalar_kernel(
                     result);
     }
 }
-// --- C2 MMA REPLACEMENT ABOVE ---
-
 int v2_grid(int64_t total) {
     constexpr int threads = 256;
     const int64_t blocks = (total + threads - 1) / threads;
@@ -115,6 +130,23 @@ bool env_flag_true(const char* name) {
     if (std::strcmp(v, "no") == 0) return false;
     if (std::strcmp(v, "No") == 0) return false;
     return true;
+}
+
+// Returns true ONLY if the env var is explicitly set to a falsy value
+// ("0" / "false" / "no" / "False" / "FALSE" / "No"). Unset env vars and
+// non-falsy values both return false. Used for "default ON" toggles where
+// we only want to disable on an explicit opt-out.
+bool env_flag_explicitly_false(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return false;
+    if (v[0] == '\0') return false;
+    if (std::strcmp(v, "0") == 0) return true;
+    if (std::strcmp(v, "false") == 0) return true;
+    if (std::strcmp(v, "False") == 0) return true;
+    if (std::strcmp(v, "FALSE") == 0) return true;
+    if (std::strcmp(v, "no") == 0) return true;
+    if (std::strcmp(v, "No") == 0) return true;
+    return false;
 }
 
 } // namespace
@@ -138,20 +170,37 @@ void sm120_fp8_mqa_logits_v2(
     DG_HOST_ASSERT(cu_seq_len_k_start.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(cu_seq_len_k_end.scalar_type() == torch::kInt);
 
-    // C2a: env-gated dispatch to the BF16 m16n8k16 tensor-core path.
-    // If ``DG_SM120_MQA_LOGITS_V2_MMA=1`` is set AND the shape is supported,
-    // run the MMA kernel and return. Otherwise fall through to the scalar
-    // path below. The MMA launch returns ``false`` for unsupported shapes
-    // (head_dim != 64, num_heads > 64, etc.) so the scalar remains a
-    // correctness-preserving fallback for all inputs.
-    if (env_flag_true("DG_SM120_MQA_LOGITS_V2_MMA")) {
+    // C3: dispatch to the BF16 m16n8k16 tensor-core path by default.
+    //
+    //   DG_SM120_MQA_LOGITS_V2_MMA=0      -> force scalar inner (escape).
+    //   DG_SM120_MQA_LOGITS_V2_MMA unset
+    //                       or anything   -> use MMA inner (default ON).
+    //
+    // The MMA launch returns ``false`` for unsupported shapes (head_dim != 64,
+    // num_heads > 64, unsupported dtype). In that case:
+    //   DG_SM120_MQA_LOGITS_V2_STRICT=1   -> hard-fail (dev mode, catches
+    //                                        silent fallbacks).
+    //   otherwise                         -> silently fall through to the
+    //                                        scalar inner below (production
+    //                                        mode, preserves correctness for
+    //                                        any shape the v2 entry accepts).
+    const bool prefer_mma =
+        !env_flag_explicitly_false("DG_SM120_MQA_LOGITS_V2_MMA");
+    if (prefer_mma) {
         const bool launched = sm120_fp8_mqa_logits_v2_mma_try_launch(
             q, kv, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end,
             logits, logits_dtype, seq_len, seq_len_kv, max_seqlen_k,
             logits_stride, num_heads, head_dim);
         if (launched) return;
-        // Fell through: shape unsupported by the MMA path. The scalar
-        // dispatch below handles every input the v2 entry point accepts.
+        if (env_flag_true("DG_SM120_MQA_LOGITS_V2_STRICT")) {
+            DG_HOST_UNREACHABLE(
+                "DG_SM120_MQA_LOGITS_V2_STRICT=1: MMA path could not handle "
+                "this shape (head_dim must be 64 and num_heads <= 64; logits "
+                "dtype must be FP32 or BF16). Either widen the MMA kernel's "
+                "supported shapes, or unset STRICT to silently fall back to "
+                "the scalar inner.");
+        }
+        // Else fall through to scalar (silent fallback for unsupported shapes).
     }
 
     const int out_cols = max_seqlen_k > 0 ? max_seqlen_k : seq_len_kv;
@@ -198,12 +247,13 @@ void register_mqa_logits_v2_apis(pybind11::module& m) {
           pybind11::arg("logits_stride"), pybind11::arg("num_heads"),
           pybind11::arg("head_dim"),
           "SM120 FP8 MQA logits v2 (non-paged): replacement for "
-          "sm120_fp8_mqa_logits_fallback. Default path is the C1 scalar "
-          "inner (bit-exact to the existing fallback). Set the environment "
-          "variable DG_SM120_MQA_LOGITS_V2_MMA=1 to dispatch through the "
-          "C2a BF16 m16n8k16 tensor-core kernel for supported shapes "
-          "(head_dim=64, num_heads<=64); unsupported shapes transparently "
-          "fall back to the scalar inner.");
+          "sm120_fp8_mqa_logits_fallback. Default path is the C2a BF16 "
+          "m16n8k16 tensor-core inner for supported shapes (head_dim=64, "
+          "num_heads<=64). Set DG_SM120_MQA_LOGITS_V2_MMA=0 to force the "
+          "C1 scalar inner (e.g. for A/B comparison). Unsupported shapes "
+          "transparently fall back to the scalar inner unless "
+          "DG_SM120_MQA_LOGITS_V2_STRICT=1 (in which case they raise a "
+          "host error to catch silent shape fallbacks).");
 }
 
 } // namespace sm120_mla_v2

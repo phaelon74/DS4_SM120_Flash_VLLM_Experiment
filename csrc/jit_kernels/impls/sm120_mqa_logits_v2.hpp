@@ -14,14 +14,22 @@ namespace sm120_mla_v2 {
 // 16k uncached prompt tokens (961 / 3647 / 13963 ms respectively, growing
 // near-quadratically in prompt length).
 //
-// C1: scaffold with scalar inner, correctness-equivalent to
-// ``sm120_fp8_mqa_logits_fallback``. Provides the entry point and Python
-// binding.
+// C1:  scaffold with scalar inner, correctness-equivalent to
+//      ``sm120_fp8_mqa_logits_fallback``. Provides the entry point and
+//      Python binding.
 //
-// C2a (current): adds a BF16 m16n8k16 mma.sync tensor-core path. Selected
-// at runtime via ``DG_SM120_MQA_LOGITS_V2_MMA=1`` (default off so that
-// existing scalar correctness is preserved by default; the MMA path is
-// validated end-to-end before being promoted to default-on in C3).
+// C2a: adds a BF16 m16n8k16 mma.sync tensor-core path. Synthetic correctness
+//      validated against torch ref + apis fallback (FP32 max_diff < 5e-3,
+//      BF16 max_rel < 8e-3); 33x faster than the scalar inner at S=16k
+//      (10.97 ms vs 365 ms; 706 us at S=4k).
+//
+// C3 (current): wired into the SM120 dispatch in ``csrc/apis/attention.hpp``
+//      in place of ``sm120_fp8_mqa_logits_fallback``. The MMA inner is
+//      default ON in this entry point. Toggles:
+//        DG_SM120_MQA_LOGITS_V2_MMA=0     -> force the scalar inner.
+//        DG_SM120_MQA_LOGITS_V2_STRICT=1  -> hard-fail on shapes the MMA
+//                                            path cannot handle (default OFF
+//                                            silently falls back to scalar).
 //
 // Math factorization that makes the MMA path clean:
 //   logits[m,n] = sum_h max(0, sum_d q[m,h,d]*kv[n,d]*kv_sf[n]) * weights[m,h]

@@ -9,6 +9,7 @@
 #include "../jit_kernels/impls/smxx_fp8_fp4_mqa_logits.hpp"
 #include "../jit_kernels/impls/smxx_fp8_fp4_paged_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm120_mqa_logits_fallback.hpp"
+#include "../jit_kernels/impls/sm120_mqa_logits_v2.hpp"
 #include "../jit_kernels/impls/smxx_clean_logits.hpp"
 #endif
 
@@ -182,11 +183,18 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
                                       max_seqlen_k, stride_logits,
                                       num_heads, head_dim);
     } else if (not is_fp4 and arch_major == 12) {
-        sm120_fp8_mqa_logits_fallback(q_fp, kv_fp, kv_sf, weights,
-                                      cu_seq_len_k_start, cu_seq_len_k_end, logits,
-                                      logits_dtype, seq_len, seq_len_kv,
-                                      max_seqlen_k, stride_logits,
-                                      num_heads, head_dim);
+        // C3: route through the SM120 MQA logits v2 entry point. By default
+        // this dispatches to the C2a BF16 m16n8k16 tensor-core inner
+        // (~33x faster than the scalar fallback at S=16k); unsupported
+        // shapes silently fall back to the scalar inner unless
+        // DG_SM120_MQA_LOGITS_V2_STRICT=1 is set. Set
+        // DG_SM120_MQA_LOGITS_V2_MMA=0 to force the scalar inner for A/B.
+        sm120_mla_v2::sm120_fp8_mqa_logits_v2(
+            q_fp, kv_fp, kv_sf, weights,
+            cu_seq_len_k_start, cu_seq_len_k_end, logits,
+            logits_dtype, seq_len, seq_len_kv,
+            max_seqlen_k, stride_logits,
+            num_heads, head_dim);
     } else if (is_fp4 and arch_major == 10) {
         sm100_fp4_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                              seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
