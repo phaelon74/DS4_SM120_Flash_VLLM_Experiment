@@ -46,6 +46,7 @@ sources = [
     'csrc/sm120_fp8_gemm_fallback.cu',
     'csrc/sm120_mqa_logits_fallback.cu',
     'csrc/sm120_mqa_logits_v2.cu',
+    'csrc/sm120_mqa_logits_v2_mma.cu',
     'csrc/sm120_hc_prenorm_fallback.cu',
     'csrc/sm120_tf32_hc_prenorm_gemm.cu',
     'csrc/sm120_sparse_mla_decode.cu',

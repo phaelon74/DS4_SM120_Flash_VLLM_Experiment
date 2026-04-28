@@ -14,11 +14,21 @@ namespace sm120_mla_v2 {
 // 16k uncached prompt tokens (961 / 3647 / 13963 ms respectively, growing
 // near-quadratically in prompt length).
 //
-// C1 (this commit): scaffold with scalar inner, correctness-equivalent to
+// C1: scaffold with scalar inner, correctness-equivalent to
 // ``sm120_fp8_mqa_logits_fallback``. Provides the entry point and Python
-// binding that subsequent commits will upgrade to a tensor-core BF16
-// m16n8k16 mma.sync implementation (target: ~200x faster on the kernel
-// itself, ~4x TTFT improvement at 16k).
+// binding.
+//
+// C2a (current): adds a BF16 m16n8k16 mma.sync tensor-core path. Selected
+// at runtime via ``DG_SM120_MQA_LOGITS_V2_MMA=1`` (default off so that
+// existing scalar correctness is preserved by default; the MMA path is
+// validated end-to-end before being promoted to default-on in C3).
+//
+// Math factorization that makes the MMA path clean:
+//   logits[m,n] = sum_h max(0, sum_d q[m,h,d]*kv[n,d]*kv_sf[n]) * weights[m,h]
+//               = kv_sf[n] * sum_h max(0, [Q[m,h,:] @ K[n,:]^T]) * weights[m,h]
+// (valid because kv_sf[n] >= 0).
+// The bracketed term is a pure unscaled BF16 matmul; ``kv_sf[n]`` becomes a
+// single per-N scalar multiply applied in the final epilogue.
 //
 // Scope is non-paged FP8 only:
 //  - Paged FP8 already routes through the FAST kernel
@@ -26,6 +36,21 @@ namespace sm120_mla_v2 {
 //    a meaningful bottleneck.
 //  - FP4 paths are not exercised by the live DeepSeek V4 Flash dispatch.
 void sm120_fp8_mqa_logits_v2(
+    const torch::Tensor& q, const torch::Tensor& kv, const torch::Tensor& kv_sf,
+    const torch::Tensor& weights, const torch::Tensor& cu_seq_len_k_start,
+    const torch::Tensor& cu_seq_len_k_end, const torch::Tensor& logits,
+    const at::ScalarType& logits_dtype, int seq_len, int seq_len_kv,
+    int max_seqlen_k, int logits_stride, int num_heads, int head_dim);
+
+// C2a MMA launch entry. Implemented in ``csrc/sm120_mqa_logits_v2_mma.cu``.
+// Returns ``true`` if the MMA fast path was launched, ``false`` if the
+// kernel detected an unsupported shape combination and the caller must fall
+// back to the scalar path. Currently supported:
+//   * ``logits_dtype`` in {kFloat32, kBFloat16}
+//   * ``head_dim == 64`` (the live DeepSeek V4 sparse indexer head dim)
+//   * ``num_heads <= 64`` (the SMEM weights buffer cap)
+// Any other combination returns ``false`` without writing to ``logits``.
+bool sm120_fp8_mqa_logits_v2_mma_try_launch(
     const torch::Tensor& q, const torch::Tensor& kv, const torch::Tensor& kv_sf,
     const torch::Tensor& weights, const torch::Tensor& cu_seq_len_k_start,
     const torch::Tensor& cu_seq_len_k_end, const torch::Tensor& logits,

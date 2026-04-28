@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # scripts/test_sm120_mqa_logits_v2.py
 #
-# Isolated correctness check for the SM120 MQA logits v2 scaffold (C1).
+# Isolated correctness check for the SM120 MQA logits v2 entry point.
 #
-# C1 ships a scalar inner that implements the same arithmetic as
-# ``deep_gemm::sm120_fallback::mqa_logits_kernel<*, false>`` (the existing
-# FP8 non-paged fallback). The kernel reduces FP32 internally and casts to
-# the requested output dtype at the end, so the per-dtype tolerances are:
+# Two inner paths are exercised by default:
+#
+#   * "scalar" (C1):  bit-exact to deep_gemm::sm120_fallback::mqa_logits_kernel.
+#   * "mma"    (C2a): BF16 m16n8k16 mma.sync tensor-core path. Selected by
+#                     setting DG_SM120_MQA_LOGITS_V2_MMA=1 around the call.
+#
+# Both paths reduce FP32 internally and cast to the requested output dtype
+# at the end, so the per-dtype tolerances are the same:
 #
 #   * FP32 output: max_diff < 5e-3 (FP8 input quant + FP32 reduction order).
 #   * BF16 output: max_rel < 1.6e-2 (one BF16 ULP at the result magnitude).
 #
-# C2 will replace the inner with a BF16 m16n8k16 mma.sync tensor-core
-# implementation. The same tolerance criteria still apply (the reduction is
-# still FP32-accumulated), and the headline becomes the speedup vs the apis
-# fallback bench.
+# Use ``--paths scalar`` or ``--paths mma`` to test only one inner. Use
+# ``--bench`` to add per-path microbench numbers (the headline speedup of
+# C2a vs the C1 scalar / apis fallback).
 #
 # Usage:
 #   docker compose exec -T vllm bash -lc \
@@ -27,6 +30,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import sys
 import time
 from typing import Tuple
@@ -35,6 +40,29 @@ import torch
 
 import deep_gemm
 import deep_gemm._C as _C
+
+
+# ---------------------------------------------------------------------------
+# Env helpers: flip ``DG_SM120_MQA_LOGITS_V2_MMA`` per-call so we can A/B
+# the scalar inner against the C2a MMA inner without restarting the process.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _env_var(name: str, value: str | None):
+    """Temporarily set ``name=value`` in os.environ; restore on exit."""
+    prev = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = prev
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +236,15 @@ def _torch_reference(inputs: dict, *, dtype: torch.dtype) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device):
+def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device,
+             path: str = "scalar"):
+    """Call the v2 entry point with the inner selected by ``path``.
+
+    path = "scalar"  ->  unset DG_SM120_MQA_LOGITS_V2_MMA (C1 scalar inner)
+    path = "mma"     ->  set DG_SM120_MQA_LOGITS_V2_MMA=1 (C2a MMA inner)
+    """
+    if path not in ("scalar", "mma"):
+        raise ValueError(f"path must be 'scalar' or 'mma', got {path!r}")
     full, view, stride_logits = _allocate_logits(
         seq_len=inputs["seq_len"],
         seq_len_kv=inputs["seq_len_kv"],
@@ -216,22 +252,24 @@ def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device):
         device=device,
         dtype=dtype,
     )
-    _C.sm120_fp8_mqa_logits_v2(
-        q=inputs["q"],
-        kv=inputs["kv"],
-        kv_sf=inputs["kv_sf"],
-        weights=inputs["weights"],
-        cu_seq_len_k_start=inputs["cu_seq_len_k_start"],
-        cu_seq_len_k_end=inputs["cu_seq_len_k_end"],
-        logits=view,
-        logits_dtype=dtype,
-        seq_len=inputs["seq_len"],
-        seq_len_kv=inputs["seq_len_kv"],
-        max_seqlen_k=inputs["max_seqlen_k"],
-        logits_stride=stride_logits,
-        num_heads=inputs["num_heads"],
-        head_dim=inputs["head_dim"],
-    )
+    env_value = "1" if path == "mma" else None
+    with _env_var("DG_SM120_MQA_LOGITS_V2_MMA", env_value):
+        _C.sm120_fp8_mqa_logits_v2(
+            q=inputs["q"],
+            kv=inputs["kv"],
+            kv_sf=inputs["kv_sf"],
+            weights=inputs["weights"],
+            cu_seq_len_k_start=inputs["cu_seq_len_k_start"],
+            cu_seq_len_k_end=inputs["cu_seq_len_k_end"],
+            logits=view,
+            logits_dtype=dtype,
+            seq_len=inputs["seq_len"],
+            seq_len_kv=inputs["seq_len_kv"],
+            max_seqlen_k=inputs["max_seqlen_k"],
+            logits_stride=stride_logits,
+            num_heads=inputs["num_heads"],
+            head_dim=inputs["head_dim"],
+        )
     return view.clone()
 
 
@@ -288,6 +326,7 @@ def _run_case(
     device: torch.device,
     seed: int,
     bench: bool,
+    path: str = "scalar",
 ):
     inputs = _synthesize_inputs(
         seq_len=seq_len,
@@ -300,8 +339,8 @@ def _run_case(
         seed=seed,
     )
 
-    # v2 kernel under test.
-    out_v2 = _call_v2(inputs, dtype=dtype, device=device)
+    # v2 kernel under test (path = "scalar" or "mma").
+    out_v2 = _call_v2(inputs, dtype=dtype, device=device, path=path)
 
     # Try to also call the existing apis-bound dispatch as an additional
     # cross-check. On SM120 this hits sm120_fp8_mqa_logits_fallback. The
@@ -364,8 +403,8 @@ def _run_case(
     mask_match = torch.equal(mask_v2, mask_ref)
 
     print(
-        f"  shape S={seq_len}, Skv={seq_len_kv}, H={num_heads}, D={head_dim}, "
-        f"compressed={compressed}, causal={causal}, dtype={dtype}"
+        f"  [{path}] shape S={seq_len}, Skv={seq_len_kv}, H={num_heads}, "
+        f"D={head_dim}, compressed={compressed}, causal={causal}, dtype={dtype}"
     )
     print(
         f"    vs torch ref:     max_diff={v2_max:.3e}  mean_diff={v2_mean:.3e}  "
@@ -409,8 +448,10 @@ def _run_case(
     print(f"    C1 pass: {c1_ok} ({why})")
 
     if bench:
-        v2_us = _bench_us(lambda: _call_v2(inputs, dtype=dtype, device=device))
-        print(f"    v2 scalar bench: {v2_us:.1f} us / call")
+        v2_us = _bench_us(
+            lambda: _call_v2(inputs, dtype=dtype, device=device, path=path)
+        )
+        print(f"    v2 [{path}] bench: {v2_us:.1f} us / call")
         if out_fallback is not None:
             try:
                 fb_us = _bench_us(lambda: _call_fallback_via_apis(inputs))
@@ -425,6 +466,12 @@ def main():
     parser.add_argument("--bench", action="store_true",
                         help="microbench v2 vs fallback (slow)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--paths",
+        default="scalar,mma",
+        help="comma-separated list of v2 inner paths to test "
+             "(scalar | mma | scalar,mma). Default: both.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -432,53 +479,73 @@ def main():
         return 0
 
     device = torch.device("cuda")
+    paths = [p.strip() for p in args.paths.split(",") if p.strip()]
+    for p in paths:
+        if p not in ("scalar", "mma"):
+            print(f"[error] unknown --paths value {p!r}; expected scalar/mma")
+            return 1
 
     cases = [
         # (S, Skv, H, D, compressed, causal)
         (32, 256, 32, 64, False, False),       # tiny dense
         (32, 256, 32, 64, False, True),        # tiny causal
         (128, 1024, 32, 64, False, True),      # decode-shape causal
-        (256, 4096, 32, 64, True, True),       # 4k compressed causal
+        (256, 4096, 32, 64, True, True),       # 4k compressed causal (uniform start)
         (64, 8192, 32, 64, False, False),      # wide kv
     ]
 
-    print("== SM120 MQA logits v2 (C1 scalar) correctness ==")
-    all_ok = True
-    for shape in cases:
-        S, Skv, H, D, compressed, causal = shape
-        for dtype in (torch.float32, torch.bfloat16):
-            ok = _run_case(
-                seq_len=S,
-                seq_len_kv=Skv,
-                num_heads=H,
-                head_dim=D,
-                compressed=compressed,
-                causal=causal,
-                dtype=dtype,
-                device=device,
-                seed=args.seed,
-                bench=args.bench,
+    overall_ok = True
+    per_path_ok: dict[str, bool] = {}
+    for path in paths:
+        if path == "mma":
+            print(
+                "== SM120 MQA logits v2 (C2a MMA, "
+                "DG_SM120_MQA_LOGITS_V2_MMA=1) correctness =="
             )
-            all_ok = all_ok and ok
+        else:
+            print("== SM120 MQA logits v2 (C1 scalar) correctness ==")
+        path_ok = True
+        for shape in cases:
+            S, Skv, H, D, compressed, causal = shape
+            for dtype in (torch.float32, torch.bfloat16):
+                ok = _run_case(
+                    seq_len=S,
+                    seq_len_kv=Skv,
+                    num_heads=H,
+                    head_dim=D,
+                    compressed=compressed,
+                    causal=causal,
+                    dtype=dtype,
+                    device=device,
+                    seed=args.seed,
+                    bench=args.bench,
+                    path=path,
+                )
+                path_ok = path_ok and ok
+        per_path_ok[path] = path_ok
+        overall_ok = overall_ok and path_ok
+        print()
 
-    print()
-    if all_ok:
-        print("[verdict] C1 scaffold PASSES synthetic correctness.")
+    for path in paths:
+        label = "C2a MMA" if path == "mma" else "C1 scalar"
+        if per_path_ok[path]:
+            print(f"[verdict] {label} PASSES synthetic correctness.")
+        else:
+            print(f"[verdict] {label} FAILED at least one case. Inspect "
+                  "max_diff / max_rel / mask_match per shape above.")
+
+    print(
+        "          Per-dtype gates: FP32 max_diff < 5e-3, "
+        "BF16 max_rel < 1.6e-2, both with strict mask_match."
+    )
+    if "mma" in paths and per_path_ok.get("mma", False):
         print(
-            "          Per-dtype gates: FP32 max_diff < 5e-3, "
-            "BF16 max_rel < 1.6e-2, both with strict mask_match."
+            "          C2a synthetic correctness validated; next step is the "
+            "microbench (scripts/bench_sm120_mqa_logits_v2.py) at 4k/8k/16k "
+            "prompt-shaped inputs to measure the kernel-level speedup vs the "
+            "apis fallback before moving to live wire-up in C3."
         )
-        print(
-            "          Next: C2 replaces the inner with BF16 m16n8k16 mma.sync. "
-            "The same tolerance gates apply (the reduction stays FP32-accumulated); "
-            "the headline becomes speedup vs the apis fallback bench at "
-            "S=4k/8k/16k prompt-shaped inputs."
-        )
-        return 0
-    else:
-        print("[verdict] C1 scaffold FAILED at least one case. Inspect "
-              "max_diff / max_rel / mask_match per shape above.")
-        return 1
+    return 0 if overall_ok else 1
 
 
 if __name__ == "__main__":
