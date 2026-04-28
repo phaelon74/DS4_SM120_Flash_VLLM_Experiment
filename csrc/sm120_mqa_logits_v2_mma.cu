@@ -73,13 +73,36 @@ constexpr int kKChunk = 16;       // m16n8k16
 constexpr int kNumWarps = 4;
 constexpr int kNTilePerCta = kNPerWarp * kNumWarps;  // 32
 constexpr int kThreadsPerCta = 32 * kNumWarps;        // 128
-constexpr int kHeadDimSupported = 64;                  // 4 K-iters
 constexpr int kHeadMax = 64;                            // SMEM cap on num_heads
-constexpr int kKItersPerHead = kHeadDimSupported / kKChunk;  // 4
 
-// SMEM pad to keep 16-byte aligned rows and avoid bank conflicts on D=64.
-// Padding by 8 BF16 (16 bytes) shifts each row's bank assignment.
-constexpr int kDPad = kHeadDimSupported + 8;
+// C4: the kernel is now templated on ``kHeadDim``. Two instantiations are
+// supported: ``kHeadDim == 64`` (the original C2a synthetic shape; kept for
+// regression coverage and tests) and ``kHeadDim == 128`` (the live
+// DeepSeek V4 sparse indexer shape, confirmed via DG_SM120_MQA_LOGITS_V2_TRACE
+// on a real prefill request: seq_len=4096, seq_len_kv=1024, num_heads=64,
+// head_dim=128, dtype=fp32). Each instantiation derives ``kKItersPerHead``
+// and ``kDPad`` from ``kHeadDim`` at compile time so the inner MMA loop
+// remains fully unrolled and SMEM strides are constant.
+//
+//   kHeadDim    kKItersPerHead    kDPad    per-CTA SMEM
+//      64             4             72       ~13.5 KB
+//     128             8            136       ~21.3 KB
+//
+// Both fit comfortably under the 99 KB / CTA SMEM cap on SM120 (carveout
+// not required); the larger 128 footprint reduces SM occupancy from ~7
+// blocks to ~4 blocks per SM, but the kernel is GEMM-body bound at this
+// shape so occupancy is not the limiting factor.
+template <int kHeadDim>
+struct MqaLogitsV2Consts {
+    static_assert(kHeadDim % kKChunk == 0,
+                  "kHeadDim must be a multiple of kKChunk (16) so the "
+                  "per-head MMA loop tiles cleanly.");
+    static constexpr int kKItersPerHead = kHeadDim / kKChunk;
+    // SMEM pad to keep 16-byte aligned rows and avoid bank conflicts on D
+    // (64 or 128). Padding by 8 BF16 (16 bytes) shifts each row's bank
+    // assignment regardless of kHeadDim.
+    static constexpr int kDPad = kHeadDim + 8;
+};
 
 // ---------------------------------------------------------------------------
 // Output store helper (FP32 / BF16).
@@ -99,24 +122,32 @@ __device__ __forceinline__ void store_logit_v2<__nv_bfloat16>(
 
 // ---------------------------------------------------------------------------
 // Cooperative FP8 -> BF16 dequant into SMEM.
-// Each call stages ``num_rows`` rows of length D=64 (BF16) into ``smem``.
-// Threads cooperate across all kThreadsPerCta to cover the tile. For
-// row_stride > 0 (Q has [M, H, D] stride = num_heads*D in the per-head row
-// stride; we pass the head-major sub-stride here), GMEM reads remain coalesced
-// because each row's D=64 BF16 = 64 bytes is contiguous.
+// Each call stages ``num_rows`` rows of length ``kHeadDim`` (BF16) into
+// ``smem``. Threads cooperate across all kThreadsPerCta to cover the tile.
+// For row_stride > 0 (Q has [M, H, D] stride = num_heads*D in the per-head
+// row stride; we pass the head-major sub-stride here), GMEM reads remain
+// coalesced because each row's kHeadDim BF16 bytes are contiguous.
+//
+// Templated on kHeadDim so the inner ``i / kHeadDim`` and ``i - row*kHeadDim``
+// reduce to compile-time constant divides (powers of two: 64, 128).
 // ---------------------------------------------------------------------------
 
+template <int kHeadDim>
 __device__ __forceinline__ void stage_fp8_rows_to_bf16_smem(
     __nv_bfloat16* __restrict__ smem,         // [num_rows, kDPad]
     const __nv_fp8_e4m3* __restrict__ gmem,   // [num_rows, gmem_row_stride] (FP8)
     int num_rows, int gmem_row_stride, int tid) {
-    // Each thread covers (num_rows * D) / kThreadsPerCta scalar positions.
-    // For (num_rows=16, D=64): total 1024 elements / 128 threads = 8 per thread.
-    // For (num_rows=32, D=64): total 2048 elements / 128 threads = 16 per thread.
-    const int total = num_rows * kHeadDimSupported;
+    constexpr int kDPad = MqaLogitsV2Consts<kHeadDim>::kDPad;
+    // Each thread covers (num_rows * kHeadDim) / kThreadsPerCta scalar
+    // positions. Examples:
+    //   num_rows=16, kHeadDim=64  -> 1024 elements / 128 threads = 8 per thread
+    //   num_rows=32, kHeadDim=64  -> 2048 elements / 128 threads = 16 per thread
+    //   num_rows=16, kHeadDim=128 -> 2048 elements / 128 threads = 16 per thread
+    //   num_rows=32, kHeadDim=128 -> 4096 elements / 128 threads = 32 per thread
+    const int total = num_rows * kHeadDim;
     for (int i = tid; i < total; i += kThreadsPerCta) {
-        const int row = i / kHeadDimSupported;
-        const int col = i - row * kHeadDimSupported;
+        const int row = i / kHeadDim;
+        const int col = i - row * kHeadDim;
         const __nv_fp8_e4m3 v = gmem[row * gmem_row_stride + col];
         // FP8 e4m3 -> float -> BF16. e4m3 has 3 mantissa bits; BF16 has 8, so
         // the BF16 conversion is exact for any in-range FP8 value.
@@ -181,7 +212,7 @@ __device__ __forceinline__ void stage_kv_sf(
 // MMA kernel (BF16 m16n8k16, sequential over H, FP32 accumulator).
 // ---------------------------------------------------------------------------
 
-template <typename out_t>
+template <typename out_t, int kHeadDim>
 __global__ void __launch_bounds__(kThreadsPerCta, 1)
 fp8_mqa_logits_v2_mma_kernel(
     const __nv_fp8_e4m3* __restrict__ q,
@@ -194,6 +225,8 @@ fp8_mqa_logits_v2_mma_kernel(
     int seq_len, int seq_len_kv, int num_heads,
     int out_cols, int logits_stride, bool compressed_logits) {
     using namespace deep_gemm::sm120_native_fp8;
+    constexpr int kKItersPerHead = MqaLogitsV2Consts<kHeadDim>::kKItersPerHead;
+    constexpr int kDPad = MqaLogitsV2Consts<kHeadDim>::kDPad;
 
     const int row_block = blockIdx.x;
     const int col_block = blockIdx.y;
@@ -275,16 +308,16 @@ fp8_mqa_logits_v2_mma_kernel(
 
     // ---- Stage 2: load K tile once -----------------------------------------
     if (kv_to_load > 0) {
-        stage_fp8_rows_to_bf16_smem(
-            smem_k, kv + static_cast<int64_t>(k_base) * kHeadDimSupported,
-            kv_to_load, kHeadDimSupported, threadIdx.x);
+        stage_fp8_rows_to_bf16_smem<kHeadDim>(
+            smem_k, kv + static_cast<int64_t>(k_base) * kHeadDim,
+            kv_to_load, kHeadDim, threadIdx.x);
     }
     // Zero out unused K rows so that even if the warp does an MMA against
     // garbage rows the result is 0 (and the epilogue's per-(m,n) -inf mask
     // suppresses the write anyway).
     for (int i = kv_to_load + threadIdx.x; i < kNTilePerCta;
          i += kThreadsPerCta) {
-        for (int d = 0; d < kHeadDimSupported; ++d) {
+        for (int d = 0; d < kHeadDim; ++d) {
             smem_k[i * kDPad + d] = __float2bfloat16(0.0f);
         }
     }
@@ -296,11 +329,11 @@ fp8_mqa_logits_v2_mma_kernel(
     int buf = 0;
     // Prefetch Q for head 0.
     if (num_heads > 0) {
-        stage_fp8_rows_to_bf16_smem(
+        stage_fp8_rows_to_bf16_smem<kHeadDim>(
             smem_q_pingpong[buf],
-            q + static_cast<int64_t>(m_start) * num_heads * kHeadDimSupported
-              + 0 * kHeadDimSupported,
-            rows_in_tile, num_heads * kHeadDimSupported, threadIdx.x);
+            q + static_cast<int64_t>(m_start) * num_heads * kHeadDim
+              + 0 * kHeadDim,
+            rows_in_tile, num_heads * kHeadDim, threadIdx.x);
     }
     __syncthreads();
 
@@ -334,12 +367,12 @@ fp8_mqa_logits_v2_mma_kernel(
         // Prefetch next head into the other buffer (overlaps with this MMA).
         const int next_h = h + 1;
         if (next_h < num_heads) {
-            stage_fp8_rows_to_bf16_smem(
+            stage_fp8_rows_to_bf16_smem<kHeadDim>(
                 smem_q_pingpong[buf ^ 1],
                 q + static_cast<int64_t>(m_start) * num_heads
-                      * kHeadDimSupported
-                  + next_h * kHeadDimSupported,
-                rows_in_tile, num_heads * kHeadDimSupported, threadIdx.x);
+                      * kHeadDim
+                  + next_h * kHeadDim,
+                rows_in_tile, num_heads * kHeadDim, threadIdx.x);
         }
 
         // ---- MMA inner: 4x m16n8k16 over K_chunks of 16 elements ----------
@@ -461,8 +494,18 @@ bool sm120_fp8_mqa_logits_v2_mma_try_launch(
     const torch::Tensor& cu_seq_len_k_end, const torch::Tensor& logits,
     const at::ScalarType& logits_dtype, int seq_len, int seq_len_kv,
     int max_seqlen_k, int logits_stride, int num_heads, int head_dim) {
-    // Shape gate: head_dim must be 64, num_heads must fit in SMEM cap.
-    if (head_dim != kHeadDimSupported) return false;
+    // Shape gate: head_dim must be supported by an MMA template
+    // instantiation, num_heads must fit the SMEM weights cap. Two
+    // instantiations are compiled:
+    //
+    //   head_dim=64   -> the C2a synthetic test/regression shape.
+    //   head_dim=128  -> the live DeepSeek V4 sparse indexer shape
+    //                    (confirmed via DG_SM120_MQA_LOGITS_V2_TRACE).
+    //
+    // Any other head_dim returns false so the v2 entry falls back to the
+    // scalar inner (and, when DG_SM120_MQA_LOGITS_V2_STRICT=1, the host
+    // raises a diagnostic error including the offending shape).
+    if (head_dim != 64 && head_dim != 128) return false;
     if (num_heads <= 0 || num_heads > kHeadMax) return false;
     if (seq_len <= 0) return true;  // nothing to do, treat as success
 
@@ -477,29 +520,41 @@ bool sm120_fp8_mqa_logits_v2_mma_try_launch(
     dim3 block(kThreadsPerCta);
     const auto stream = at::cuda::getCurrentCUDAStream();
 
-    if (logits_dtype == torch::kFloat32) {
-        fp8_mqa_logits_v2_mma_kernel<float><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __nv_fp8_e4m3*>(q.data_ptr()),
-            reinterpret_cast<const __nv_fp8_e4m3*>(kv.data_ptr()),
-            kv_sf.data_ptr<float>(), weights.data_ptr<float>(),
-            cu_seq_len_k_start.data_ptr<int32_t>(),
-            cu_seq_len_k_end.data_ptr<int32_t>(),
-            logits.data_ptr<float>(),
-            seq_len, seq_len_kv, num_heads, out_cols, logits_stride,
-            compressed);
-    } else if (logits_dtype == torch::kBFloat16) {
-        fp8_mqa_logits_v2_mma_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __nv_fp8_e4m3*>(q.data_ptr()),
-            reinterpret_cast<const __nv_fp8_e4m3*>(kv.data_ptr()),
-            kv_sf.data_ptr<float>(), weights.data_ptr<float>(),
-            cu_seq_len_k_start.data_ptr<int32_t>(),
-            cu_seq_len_k_end.data_ptr<int32_t>(),
-            reinterpret_cast<__nv_bfloat16*>(logits.data_ptr()),
-            seq_len, seq_len_kv, num_heads, out_cols, logits_stride,
-            compressed);
-    } else {
-        return false;
+    // Cross product of (head_dim, dtype). Two head_dims x two dtypes = four
+    // explicit kernel instantiations. Each keeps its template parameters
+    // fully constexpr so the inner MMA loop and SMEM strides remain constant.
+#define DG_LAUNCH_V2_MMA(KHD, OUT_T, OUT_PTR_EXPR)                           \
+    fp8_mqa_logits_v2_mma_kernel<OUT_T, KHD>                                 \
+        <<<grid, block, 0, stream>>>(                                        \
+            reinterpret_cast<const __nv_fp8_e4m3*>(q.data_ptr()),            \
+            reinterpret_cast<const __nv_fp8_e4m3*>(kv.data_ptr()),           \
+            kv_sf.data_ptr<float>(), weights.data_ptr<float>(),              \
+            cu_seq_len_k_start.data_ptr<int32_t>(),                          \
+            cu_seq_len_k_end.data_ptr<int32_t>(),                            \
+            (OUT_PTR_EXPR),                                                  \
+            seq_len, seq_len_kv, num_heads, out_cols, logits_stride,         \
+            compressed)
+
+    if (head_dim == 64) {
+        if (logits_dtype == torch::kFloat32) {
+            DG_LAUNCH_V2_MMA(64, float, logits.data_ptr<float>());
+        } else if (logits_dtype == torch::kBFloat16) {
+            DG_LAUNCH_V2_MMA(64, __nv_bfloat16,
+                reinterpret_cast<__nv_bfloat16*>(logits.data_ptr()));
+        } else {
+            return false;
+        }
+    } else /* head_dim == 128 */ {
+        if (logits_dtype == torch::kFloat32) {
+            DG_LAUNCH_V2_MMA(128, float, logits.data_ptr<float>());
+        } else if (logits_dtype == torch::kBFloat16) {
+            DG_LAUNCH_V2_MMA(128, __nv_bfloat16,
+                reinterpret_cast<__nv_bfloat16*>(logits.data_ptr()));
+        } else {
+            return false;
+        }
     }
+#undef DG_LAUNCH_V2_MMA
     DG_CUDA_RUNTIME_CHECK(cudaGetLastError());
     return true;
 }

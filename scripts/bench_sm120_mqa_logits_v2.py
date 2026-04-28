@@ -136,18 +136,22 @@ def _allocate_logits(
     *,
     seq_len: int,
     seq_len_kv: int,
+    num_heads: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """Mirror ``apis/attention.hpp::fp8_mqa_logits`` allocation for the
-    non-compressed case (max_seqlen_k == 0)."""
+    non-compressed case (max_seqlen_k == 0). The aligned seq_len depends
+    on ``num_heads``: the per-CTA Q tile holds
+    ``block_q = block_qh / num_heads`` query rows."""
 
     def _align(x: int, a: int) -> int:
         return ((x + a - 1) // a) * a
 
     block_qh = 128
     block_kv = 256
-    aligned_seq_len = _align(seq_len, block_qh // 32)  # num_heads=32
+    block_q = max(1, block_qh // num_heads)
+    aligned_seq_len = _align(seq_len, block_q)
     stride_logits = _align(seq_len_kv + block_kv, 8)
     full = torch.empty(
         (aligned_seq_len, stride_logits), device=device, dtype=dtype
@@ -167,6 +171,7 @@ def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device,
         raise ValueError(path)
     _, view, stride = _allocate_logits(
         seq_len=inputs["seq_len"], seq_len_kv=inputs["seq_len_kv"],
+        num_heads=inputs["num_heads"],
         device=device, dtype=dtype,
     )
     env_value = "1" if path == "mma" else "0"
@@ -243,6 +248,22 @@ def main():
         help="comma-separated logits dtypes (float32, bfloat16)",
     )
     parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=32,
+        help="num_heads for synthetic Q/weights. Default 32 matches the "
+             "C2a synthetic shape; pass 64 for the C4 live shape.",
+    )
+    parser.add_argument(
+        "--head-dim",
+        type=int,
+        default=64,
+        help="head_dim for synthetic Q/KV. Default 64 matches the "
+             "C2a synthetic shape; pass 128 for the live DeepSeek V4 "
+             "sparse indexer shape (confirmed via "
+             "DG_SM120_MQA_LOGITS_V2_TRACE).",
+    )
+    parser.add_argument(
         "--paths",
         default="scalar,mma",
         help="v2 inner paths to bench (subset of scalar,mma). "
@@ -277,6 +298,8 @@ def main():
     print("== SM120 MQA logits v2 microbench ==")
     print(
         f"   shapes (S=Skv): {shapes}\n"
+        f"   num_heads:      {args.num_heads}\n"
+        f"   head_dim:       {args.head_dim}\n"
         f"   dtypes:         {[str(d) for d in dtypes]}\n"
         f"   paths:          {paths}"
         + ("" if args.skip_fallback else " + apis fallback")
@@ -286,7 +309,8 @@ def main():
     for S in shapes:
         # Pre-synthesize inputs once per shape (reuse across paths/dtypes).
         inputs = _synthesize_live_shape(
-            S, device=device, seed=args.seed
+            S, num_heads=args.num_heads, head_dim=args.head_dim,
+            device=device, seed=args.seed,
         )
         for dtype in dtypes:
             timings: Dict[str, float] = {}

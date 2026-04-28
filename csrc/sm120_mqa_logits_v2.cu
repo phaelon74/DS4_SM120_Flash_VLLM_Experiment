@@ -234,11 +234,11 @@ void sm120_fp8_mqa_logits_v2(
         std::snprintf(buf, sizeof(buf),
             "DG_SM120_MQA_LOGITS_V2_STRICT=1: MMA path could not handle this "
             "shape: seq_len=%d seq_len_kv=%d num_heads=%d head_dim=%d "
-            "dtype=%s. Supported window: head_dim==64, num_heads<=64, dtype "
-            "in {fp32, bf16}. Either widen the MMA kernel's supported shapes "
-            "to include this shape, or unset STRICT to silently fall back to "
-            "the scalar inner.", seq_len, seq_len_kv, num_heads, head_dim,
-            dtype_name);
+            "dtype=%s. Supported window: head_dim in {64, 128}, "
+            "num_heads<=64, dtype in {fp32, bf16}. Either widen the MMA "
+            "kernel's supported shapes to include this shape, or unset "
+            "STRICT to silently fall back to the scalar inner.",
+            seq_len, seq_len_kv, num_heads, head_dim, dtype_name);
         DG_HOST_UNREACHABLE(buf);
     }
     // Else fall through to scalar (silent fallback for unsupported shapes).

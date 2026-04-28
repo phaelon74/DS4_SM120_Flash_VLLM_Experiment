@@ -157,17 +157,26 @@ def _allocate_logits(
     seq_len: int,
     seq_len_kv: int,
     max_seqlen_k: int,
+    num_heads: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, int]:
-    """Mirror the allocation in apis/attention.hpp::fp8_mqa_logits."""
+    """Mirror the allocation in apis/attention.hpp::fp8_mqa_logits.
+
+    The apis fallback tile is ``block_qh = 128`` queries-x-heads, so the
+    aligned seq_len depends on ``num_heads``: the per-CTA Q tile holds
+    ``block_q = block_qh / num_heads`` query rows. Hardcoding
+    ``block_qh / 32`` worked for the C2a synthetic case (num_heads=32) but
+    misaligned the buffer for the C4 live shape (num_heads=64).
+    """
 
     def _align(x: int, a: int) -> int:
         return ((x + a - 1) // a) * a
 
     block_qh = 128
     block_kv = 256
-    aligned_seq_len = _align(seq_len, block_qh // 32)  # num_heads=32
+    block_q = max(1, block_qh // num_heads)
+    aligned_seq_len = _align(seq_len, block_q)
     if max_seqlen_k == 0:
         stride_logits = _align(seq_len_kv + block_kv, 8)
         full = torch.empty(
@@ -257,6 +266,7 @@ def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device,
         seq_len=inputs["seq_len"],
         seq_len_kv=inputs["seq_len_kv"],
         max_seqlen_k=inputs["max_seqlen_k"],
+        num_heads=inputs["num_heads"],
         device=device,
         dtype=dtype,
     )
@@ -495,11 +505,23 @@ def main():
 
     cases = [
         # (S, Skv, H, D, compressed, causal)
+        # --- C2a synthetic shape (H=32, D=64): kept for regression coverage.
         (32, 256, 32, 64, False, False),       # tiny dense
         (32, 256, 32, 64, False, True),        # tiny causal
         (128, 1024, 32, 64, False, True),      # decode-shape causal
         (256, 4096, 32, 64, True, True),       # 4k compressed causal (uniform start)
         (64, 8192, 32, 64, False, False),      # wide kv
+        # --- C4 live shape (H=64, D=128): the live DeepSeek V4 sparse
+        # indexer dispatches with num_heads=64, head_dim=128. Trace data
+        # confirmed prefill is (S=4096, Skv=1024) and decode is
+        # (S=4, Skv=1025). The cases below cover both regimes plus a
+        # compressed-mode variant; smaller seq_lens are used so the test
+        # stays fast (the synthetic torch reference is O(S * Skv * H * D)).
+        (32, 64, 64, 128, False, False),       # tiny dense (H=64, D=128)
+        (32, 64, 64, 128, False, True),        # tiny causal
+        (4, 1024, 64, 128, False, False),      # decode-shape (S=4, Skv=1024)
+        (64, 256, 64, 128, False, True),       # short causal prefill
+        (128, 256, 64, 128, True, True),       # compressed causal prefill
     ]
 
     overall_ok = True

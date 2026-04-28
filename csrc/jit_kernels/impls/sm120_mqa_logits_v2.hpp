@@ -50,12 +50,20 @@ void sm120_fp8_mqa_logits_v2(
     const at::ScalarType& logits_dtype, int seq_len, int seq_len_kv,
     int max_seqlen_k, int logits_stride, int num_heads, int head_dim);
 
-// C2a MMA launch entry. Implemented in ``csrc/sm120_mqa_logits_v2_mma.cu``.
+// C2a/C4 MMA launch entry. Implemented in ``csrc/sm120_mqa_logits_v2_mma.cu``.
 // Returns ``true`` if the MMA fast path was launched, ``false`` if the
 // kernel detected an unsupported shape combination and the caller must fall
 // back to the scalar path. Currently supported:
 //   * ``logits_dtype`` in {kFloat32, kBFloat16}
-//   * ``head_dim == 64`` (the live DeepSeek V4 sparse indexer head dim)
+//   * ``head_dim`` in {64, 128}
+//       - 64  is the C2a synthetic test/regression shape.
+//       - 128 is the live DeepSeek V4 sparse indexer prefill+decode shape
+//             (confirmed via DG_SM120_MQA_LOGITS_V2_TRACE on a real
+//             4096-prompt request: seq_len=4096, seq_len_kv=1024,
+//             num_heads=64, head_dim=128, dtype=fp32). The C2a draft only
+//             supported head_dim=64 and silently fell back to the scalar
+//             inner on every live call; C4 added the templated-on-kHeadDim
+//             instantiation so the MMA path actually runs in production.
 //   * ``num_heads <= 64`` (the SMEM weights buffer cap)
 // Any other combination returns ``false`` without writing to ``logits``.
 bool sm120_fp8_mqa_logits_v2_mma_try_launch(
