@@ -3,13 +3,18 @@
 #
 # Isolated correctness check for the SM120 MQA logits v2 scaffold (C1).
 #
-# C1 ships a scalar inner that is bit-exact to
+# C1 ships a scalar inner that implements the same arithmetic as
 # ``deep_gemm::sm120_fallback::mqa_logits_kernel<*, false>`` (the existing
-# FP8 non-paged fallback). This script invokes both paths against the same
-# synthetic inputs and asserts max-diff == 0. C2 will replace the inner with
-# a BF16 m16n8k16 mma.sync tensor-core implementation; at that point the
-# tolerance switches to BF16 noise (~5e-4) and the speedup is the headline
-# number.
+# FP8 non-paged fallback). The kernel reduces FP32 internally and casts to
+# the requested output dtype at the end, so the per-dtype tolerances are:
+#
+#   * FP32 output: max_diff < 5e-3 (FP8 input quant + FP32 reduction order).
+#   * BF16 output: max_rel < 1.6e-2 (one BF16 ULP at the result magnitude).
+#
+# C2 will replace the inner with a BF16 m16n8k16 mma.sync tensor-core
+# implementation. The same tolerance criteria still apply (the reduction is
+# still FP32-accumulated), and the headline becomes the speedup vs the apis
+# fallback bench.
 #
 # Usage:
 #   docker compose exec -T vllm bash -lc \
@@ -230,26 +235,29 @@ def _call_v2(inputs: dict, *, dtype: torch.dtype, device: torch.device):
     return view.clone()
 
 
-def _call_fallback_via_apis(inputs: dict, *, dtype: torch.dtype):
+def _call_fallback_via_apis(inputs: dict):
     """Dispatch through deep_gemm._C.fp8_mqa_logits which routes to the
-    SM120 fallback on this hardware. Returns the (already sliced) logits."""
-    out = _C.fp8_mqa_logits(
+    SM120 fallback on this hardware. Output dtype is chosen by the api;
+    return whatever it gives so the caller can compare appropriately.
+
+    Pybind signature (verified):
+        fp8_mqa_logits(q: Tensor,
+                       kv: tuple[Tensor, Tensor],
+                       weights: Tensor,
+                       cu_seq_len_k_start: Tensor,
+                       cu_seq_len_k_end: Tensor,
+                       clean_logits: bool = True,
+                       max_seqlen_k: int = 0) -> Tensor
+    """
+    return _C.fp8_mqa_logits(
         inputs["q"],
-        None,  # q_sf -- not needed for FP8 path
-        inputs["kv"],
-        inputs["kv_sf"],
+        (inputs["kv"], inputs["kv_sf"]),
         inputs["weights"],
         inputs["cu_seq_len_k_start"],
         inputs["cu_seq_len_k_end"],
-        dtype,
-        inputs["seq_len"],
-        inputs["seq_len_kv"],
-        inputs["max_seqlen_k"],
-        128,
-        256,
         False,  # clean_logits
+        inputs["max_seqlen_k"],
     )
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -295,15 +303,31 @@ def _run_case(
     # v2 kernel under test.
     out_v2 = _call_v2(inputs, dtype=dtype, device=device)
 
-    # Try to also call the existing apis-bound dispatch as an additional
-    # cross-check. On SM120 this hits sm120_fp8_mqa_logits_fallback. If the
-    # symbol or signature is not what we expect, just skip it; the torch
-    # reference below is the authoritative comparison.
-    out_fallback = None
-    try:
-        out_fallback = _call_fallback_via_apis(inputs, dtype=dtype)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [info] apis fp8_mqa_logits comparison skipped: {exc}")
+            # Try to also call the existing apis-bound dispatch as an additional
+            # cross-check. On SM120 this hits sm120_fp8_mqa_logits_fallback. The
+            # api returns a tensor in its own chosen dtype (FP32 in current
+            # bindings); cast to ``dtype`` for diff. If the symbol or signature
+            # is not what we expect, skip it cleanly: the torch reference below
+            # is the authoritative comparison.
+            out_fallback = None
+            try:
+                out_fallback_raw = _call_fallback_via_apis(inputs)
+                # The api may return more columns than ``out_v2`` if
+                # ``max_seqlen_k`` is 0 (non-compressed) and the api pads to
+                # the next 256 boundary. Slice to the v2 view for comparison.
+                if out_fallback_raw.shape != out_v2.shape:
+                    s, c = out_v2.shape
+                    if (
+                        out_fallback_raw.dim() == 2
+                        and out_fallback_raw.shape[0] >= s
+                        and out_fallback_raw.shape[1] >= c
+                    ):
+                        out_fallback_raw = out_fallback_raw[:s, :c]
+                out_fallback = out_fallback_raw.to(dtype)
+            except Exception as exc:  # noqa: BLE001
+                # Truncate the pybind error tail — its signature dump is huge.
+                msg = str(exc).splitlines()[0] if str(exc) else repr(exc)
+                print(f"  [info] apis fp8_mqa_logits comparison skipped: {msg}")
 
     # Torch reference (FP32 in, cast to dtype). This is the math the v2
     # scalar inner implements directly.
@@ -352,21 +376,44 @@ def _run_case(
             f"    vs apis fallback: max_diff={fb_max:.3e}  mean_diff={fb_mean:.3e}"
         )
 
-    # C1 pass criteria: scalar inner is identical to the reference up to
-    # FP32 reduction order noise. Tolerance = 1e-3 absolute (the kernel
-    # reduces in a different order than the reference einsum) plus a sanity
-    # cap on large-relative outliers.
-    c1_ok = (v2_max < 1e-2) and mask_match
-    print(f"    C1 pass: {c1_ok}")
+            # C1 pass criteria are gated on the output dtype because the kernel
+            # downcasts the FP32 reduction result to ``dtype`` at the very end:
+            #
+            #   * FP32 output:  diff is FP8-input-quant + FP32-reduction-order
+            #                   noise. Empirically <= ~5e-3 absolute over the
+            #                   shapes covered here. Use ``max_diff < 5e-3``.
+            #   * BF16 output:  diff is dominated by the final
+            #                   ``__float2bfloat16`` rounding (1 ULP at the
+            #                   value's magnitude). For result magnitudes up to
+            #                   ~16, 1 BF16 ULP is up to ~0.125 absolute.
+            #                   Gate on relative error: BF16 machine epsilon is
+            #                   ``2^-7 ~ 7.81e-3``; we accept a small headroom
+            #                   for ULP rounding ties.
+            #
+            # mask_match must always hold: mismatched -inf positions are a real
+            # bug regardless of output dtype.
+            if dtype == torch.float32:
+                c1_ok = (v2_max < 5e-3) and mask_match
+                why = f"max_diff={v2_max:.3e} < 5e-3, mask_match={mask_match}"
+            elif dtype == torch.bfloat16:
+                # 2x BF16 epsilon caps gives headroom for one extra rounding
+                # tie that the v2 path may resolve differently than the ref.
+                c1_ok = (v2_rel < 1.6e-2) and mask_match and v2_mean < 5e-3
+                why = (
+                    f"max_rel={v2_rel:.3e} < 1.6e-2, "
+                    f"mean_diff={v2_mean:.3e} < 5e-3, mask_match={mask_match}"
+                )
+            else:
+                c1_ok = False
+                why = f"unsupported dtype {dtype}"
+            print(f"    C1 pass: {c1_ok} ({why})")
 
     if bench:
         v2_us = _bench_us(lambda: _call_v2(inputs, dtype=dtype, device=device))
         print(f"    v2 scalar bench: {v2_us:.1f} us / call")
         if out_fallback is not None:
             try:
-                fb_us = _bench_us(
-                    lambda: _call_fallback_via_apis(inputs, dtype=dtype)
-                )
+                fb_us = _bench_us(lambda: _call_fallback_via_apis(inputs))
                 print(f"    apis fallback bench: {fb_us:.1f} us / call")
             except Exception:  # noqa: BLE001
                 pass
@@ -418,14 +465,19 @@ def main():
     if all_ok:
         print("[verdict] C1 scaffold PASSES synthetic correctness.")
         print(
-            "          Next: C2 replaces the inner with BF16 m16n8k16 mma.sync; "
-            "tolerance loosens to ~5e-4 (BF16 noise) and the headline becomes "
-            "speedup vs the apis fallback bench."
+            "          Per-dtype gates: FP32 max_diff < 5e-3, "
+            "BF16 max_rel < 1.6e-2, both with strict mask_match."
+        )
+        print(
+            "          Next: C2 replaces the inner with BF16 m16n8k16 mma.sync. "
+            "The same tolerance gates apply (the reduction stays FP32-accumulated); "
+            "the headline becomes speedup vs the apis fallback bench at "
+            "S=4k/8k/16k prompt-shaped inputs."
         )
         return 0
     else:
         print("[verdict] C1 scaffold FAILED at least one case. Inspect "
-              "max_diff/mask_match per shape above.")
+              "max_diff / max_rel / mask_match per shape above.")
         return 1
 
 
