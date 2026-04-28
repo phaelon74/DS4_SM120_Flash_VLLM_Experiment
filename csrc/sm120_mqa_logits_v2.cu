@@ -196,18 +196,21 @@ void sm120_fp8_mqa_logits_v2(
             logits_stride, num_heads, head_dim);
     }
 
-    // One-time diagnostic for the first few calls per process: prints the
-    // live shape and which inner was selected. This is the only way to
-    // confirm the MMA fast path is actually running on the live sparse
-    // indexer shape (the synthetic test uses head_dim=64 / num_heads=32,
-    // but the live shape is set by the model config, not the test). Capped
-    // at 4 calls so it never spams logs in production. Triggered when
-    // ``DG_SM120_MQA_LOGITS_V2_TRACE=1``; default OFF so production logs
-    // are not polluted.
+    // One-time diagnostic for the first calls per process: prints the live
+    // shape and which inner was selected. This is the only way to confirm
+    // the MMA fast path is actually running on the live sparse indexer
+    // shape (the synthetic test uses head_dim=64 / num_heads=32, but the
+    // live shape is set by the model config, not the test). Capped per
+    // process so it never spams logs in production. The cap is intentionally
+    // generous so we see both warmup/graph-capture probes AND real prefill
+    // shapes (the first 4-8 calls per process tend to be graph-capture
+    // probes with tiny seq_len; real prefill shapes show up later). Trigger
+    // when ``DG_SM120_MQA_LOGITS_V2_TRACE=1``; default OFF.
     if (env_flag_true("DG_SM120_MQA_LOGITS_V2_TRACE")) {
         static std::atomic<int> trace_count{0};
+        constexpr int kTraceCap = 64;
         const int prev = trace_count.fetch_add(1, std::memory_order_relaxed);
-        if (prev < 4) {
+        if (prev < kTraceCap) {
             const char* dtype_name = "?";
             if (logits_dtype == torch::kFloat32) dtype_name = "fp32";
             else if (logits_dtype == torch::kBFloat16) dtype_name = "bf16";
