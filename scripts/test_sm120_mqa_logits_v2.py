@@ -303,31 +303,31 @@ def _run_case(
     # v2 kernel under test.
     out_v2 = _call_v2(inputs, dtype=dtype, device=device)
 
-            # Try to also call the existing apis-bound dispatch as an additional
-            # cross-check. On SM120 this hits sm120_fp8_mqa_logits_fallback. The
-            # api returns a tensor in its own chosen dtype (FP32 in current
-            # bindings); cast to ``dtype`` for diff. If the symbol or signature
-            # is not what we expect, skip it cleanly: the torch reference below
-            # is the authoritative comparison.
-            out_fallback = None
-            try:
-                out_fallback_raw = _call_fallback_via_apis(inputs)
-                # The api may return more columns than ``out_v2`` if
-                # ``max_seqlen_k`` is 0 (non-compressed) and the api pads to
-                # the next 256 boundary. Slice to the v2 view for comparison.
-                if out_fallback_raw.shape != out_v2.shape:
-                    s, c = out_v2.shape
-                    if (
-                        out_fallback_raw.dim() == 2
-                        and out_fallback_raw.shape[0] >= s
-                        and out_fallback_raw.shape[1] >= c
-                    ):
-                        out_fallback_raw = out_fallback_raw[:s, :c]
-                out_fallback = out_fallback_raw.to(dtype)
-            except Exception as exc:  # noqa: BLE001
-                # Truncate the pybind error tail — its signature dump is huge.
-                msg = str(exc).splitlines()[0] if str(exc) else repr(exc)
-                print(f"  [info] apis fp8_mqa_logits comparison skipped: {msg}")
+    # Try to also call the existing apis-bound dispatch as an additional
+    # cross-check. On SM120 this hits sm120_fp8_mqa_logits_fallback. The
+    # api returns a tensor in its own chosen dtype (FP32 in current
+    # bindings); cast to ``dtype`` for diff. If the symbol or signature
+    # is not what we expect, skip it cleanly: the torch reference below
+    # is the authoritative comparison.
+    out_fallback = None
+    try:
+        out_fallback_raw = _call_fallback_via_apis(inputs)
+        # The api may return more columns than ``out_v2`` if
+        # ``max_seqlen_k`` is 0 (non-compressed) and the api pads to
+        # the next 256 boundary. Slice to the v2 view for comparison.
+        if out_fallback_raw.shape != out_v2.shape:
+            s, c = out_v2.shape
+            if (
+                out_fallback_raw.dim() == 2
+                and out_fallback_raw.shape[0] >= s
+                and out_fallback_raw.shape[1] >= c
+            ):
+                out_fallback_raw = out_fallback_raw[:s, :c]
+        out_fallback = out_fallback_raw.to(dtype)
+    except Exception as exc:  # noqa: BLE001
+        # Truncate the pybind error tail — its signature dump is huge.
+        msg = str(exc).splitlines()[0] if str(exc) else repr(exc)
+        print(f"  [info] apis fp8_mqa_logits comparison skipped: {msg}")
 
     # Torch reference (FP32 in, cast to dtype). This is the math the v2
     # scalar inner implements directly.
@@ -376,37 +376,37 @@ def _run_case(
             f"    vs apis fallback: max_diff={fb_max:.3e}  mean_diff={fb_mean:.3e}"
         )
 
-            # C1 pass criteria are gated on the output dtype because the kernel
-            # downcasts the FP32 reduction result to ``dtype`` at the very end:
-            #
-            #   * FP32 output:  diff is FP8-input-quant + FP32-reduction-order
-            #                   noise. Empirically <= ~5e-3 absolute over the
-            #                   shapes covered here. Use ``max_diff < 5e-3``.
-            #   * BF16 output:  diff is dominated by the final
-            #                   ``__float2bfloat16`` rounding (1 ULP at the
-            #                   value's magnitude). For result magnitudes up to
-            #                   ~16, 1 BF16 ULP is up to ~0.125 absolute.
-            #                   Gate on relative error: BF16 machine epsilon is
-            #                   ``2^-7 ~ 7.81e-3``; we accept a small headroom
-            #                   for ULP rounding ties.
-            #
-            # mask_match must always hold: mismatched -inf positions are a real
-            # bug regardless of output dtype.
-            if dtype == torch.float32:
-                c1_ok = (v2_max < 5e-3) and mask_match
-                why = f"max_diff={v2_max:.3e} < 5e-3, mask_match={mask_match}"
-            elif dtype == torch.bfloat16:
-                # 2x BF16 epsilon caps gives headroom for one extra rounding
-                # tie that the v2 path may resolve differently than the ref.
-                c1_ok = (v2_rel < 1.6e-2) and mask_match and v2_mean < 5e-3
-                why = (
-                    f"max_rel={v2_rel:.3e} < 1.6e-2, "
-                    f"mean_diff={v2_mean:.3e} < 5e-3, mask_match={mask_match}"
-                )
-            else:
-                c1_ok = False
-                why = f"unsupported dtype {dtype}"
-            print(f"    C1 pass: {c1_ok} ({why})")
+    # C1 pass criteria are gated on the output dtype because the kernel
+    # downcasts the FP32 reduction result to ``dtype`` at the very end:
+    #
+    #   * FP32 output:  diff is FP8-input-quant + FP32-reduction-order
+    #                   noise. Empirically <= ~5e-3 absolute over the
+    #                   shapes covered here. Use ``max_diff < 5e-3``.
+    #   * BF16 output:  diff is dominated by the final
+    #                   ``__float2bfloat16`` rounding (1 ULP at the
+    #                   value's magnitude). For result magnitudes up to
+    #                   ~16, 1 BF16 ULP is up to ~0.125 absolute.
+    #                   Gate on relative error: BF16 machine epsilon is
+    #                   ``2^-7 ~ 7.81e-3``; we accept a small headroom
+    #                   for ULP rounding ties.
+    #
+    # mask_match must always hold: mismatched -inf positions are a real
+    # bug regardless of output dtype.
+    if dtype == torch.float32:
+        c1_ok = (v2_max < 5e-3) and mask_match
+        why = f"max_diff={v2_max:.3e} < 5e-3, mask_match={mask_match}"
+    elif dtype == torch.bfloat16:
+        # 2x BF16 epsilon caps gives headroom for one extra rounding
+        # tie that the v2 path may resolve differently than the ref.
+        c1_ok = (v2_rel < 1.6e-2) and mask_match and v2_mean < 5e-3
+        why = (
+            f"max_rel={v2_rel:.3e} < 1.6e-2, "
+            f"mean_diff={v2_mean:.3e} < 5e-3, mask_match={mask_match}"
+        )
+    else:
+        c1_ok = False
+        why = f"unsupported dtype {dtype}"
+    print(f"    C1 pass: {c1_ok} ({why})")
 
     if bench:
         v2_us = _bench_us(lambda: _call_v2(inputs, dtype=dtype, device=device))
