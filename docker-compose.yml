@@ -126,6 +126,12 @@ services:
         # any shape outside the v2 MMA window (head_dim != 64, num_heads > 64,
         # or non-FP32/BF16 logits dtype) still produces a correct result.
         export DG_SM120_MQA_LOGITS_V2_STRICT="${DG_SM120_MQA_LOGITS_V2_STRICT:-0}"
+        # If 1, the v2 entry prints the live shape (seq_len, num_heads,
+        # head_dim, dtype) and the inner taken (MMA / scalar(MMA-rejected) /
+        # scalar(forced)) for the first 4 calls per process. Used to confirm
+        # the fast path is actually running on the live sparse indexer shape.
+        # Default 0 to keep production logs clean.
+        export DG_SM120_MQA_LOGITS_V2_TRACE="${DG_SM120_MQA_LOGITS_V2_TRACE:-0}"
         export DG_SM120_ENABLE_B12X_MOE="${DG_SM120_ENABLE_B12X_MOE:-0}"
         export DG_SM120_B12X_A1_GS="${DG_SM120_B12X_A1_GS:-1.0}"
         export DG_SM120_B12X_A2_GS="${DG_SM120_B12X_A2_GS:-1.0}"
@@ -272,6 +278,7 @@ services:
       DG_SM120_HC_PRENORM_V2: "${DG_SM120_HC_PRENORM_V2:-1}"
       DG_SM120_MQA_LOGITS_V2_MMA: "${DG_SM120_MQA_LOGITS_V2_MMA:-1}"
       DG_SM120_MQA_LOGITS_V2_STRICT: "${DG_SM120_MQA_LOGITS_V2_STRICT:-0}"
+      DG_SM120_MQA_LOGITS_V2_TRACE: "${DG_SM120_MQA_LOGITS_V2_TRACE:-0}"
       DG_SM120_ENABLE_B12X_MOE: "${DG_SM120_ENABLE_B12X_MOE:-0}"
       DG_SM120_B12X_A1_GS: "${DG_SM120_B12X_A1_GS:-1.0}"
       DG_SM120_B12X_A2_GS: "${DG_SM120_B12X_A2_GS:-1.0}"

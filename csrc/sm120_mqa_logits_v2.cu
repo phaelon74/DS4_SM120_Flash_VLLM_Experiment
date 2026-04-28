@@ -34,6 +34,8 @@
 // numbers will be captured into AGENTS.md after the C3 restart.
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -186,22 +188,57 @@ void sm120_fp8_mqa_logits_v2(
     //                                        any shape the v2 entry accepts).
     const bool prefer_mma =
         !env_flag_explicitly_false("DG_SM120_MQA_LOGITS_V2_MMA");
+    bool mma_launched = false;
     if (prefer_mma) {
-        const bool launched = sm120_fp8_mqa_logits_v2_mma_try_launch(
+        mma_launched = sm120_fp8_mqa_logits_v2_mma_try_launch(
             q, kv, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end,
             logits, logits_dtype, seq_len, seq_len_kv, max_seqlen_k,
             logits_stride, num_heads, head_dim);
-        if (launched) return;
-        if (env_flag_true("DG_SM120_MQA_LOGITS_V2_STRICT")) {
-            DG_HOST_UNREACHABLE(
-                "DG_SM120_MQA_LOGITS_V2_STRICT=1: MMA path could not handle "
-                "this shape (head_dim must be 64 and num_heads <= 64; logits "
-                "dtype must be FP32 or BF16). Either widen the MMA kernel's "
-                "supported shapes, or unset STRICT to silently fall back to "
-                "the scalar inner.");
-        }
-        // Else fall through to scalar (silent fallback for unsupported shapes).
     }
+
+    // One-time diagnostic for the first few calls per process: prints the
+    // live shape and which inner was selected. This is the only way to
+    // confirm the MMA fast path is actually running on the live sparse
+    // indexer shape (the synthetic test uses head_dim=64 / num_heads=32,
+    // but the live shape is set by the model config, not the test). Capped
+    // at 4 calls so it never spams logs in production. Triggered when
+    // ``DG_SM120_MQA_LOGITS_V2_TRACE=1``; default OFF so production logs
+    // are not polluted.
+    if (env_flag_true("DG_SM120_MQA_LOGITS_V2_TRACE")) {
+        static std::atomic<int> trace_count{0};
+        const int prev = trace_count.fetch_add(1, std::memory_order_relaxed);
+        if (prev < 4) {
+            const char* dtype_name = "?";
+            if (logits_dtype == torch::kFloat32) dtype_name = "fp32";
+            else if (logits_dtype == torch::kBFloat16) dtype_name = "bf16";
+            const char* path_name = "scalar(forced)";
+            if (prefer_mma) path_name = mma_launched ? "MMA" : "scalar(MMA-rejected)";
+            std::fprintf(stderr,
+                "[sm120_mqa_v2_trace #%d] seq_len=%d seq_len_kv=%d "
+                "num_heads=%d head_dim=%d max_seqlen_k=%d dtype=%s path=%s\n",
+                prev, seq_len, seq_len_kv, num_heads, head_dim, max_seqlen_k,
+                dtype_name, path_name);
+            std::fflush(stderr);
+        }
+    }
+
+    if (mma_launched) return;
+    if (prefer_mma && env_flag_true("DG_SM120_MQA_LOGITS_V2_STRICT")) {
+        const char* dtype_name = "?";
+        if (logits_dtype == torch::kFloat32) dtype_name = "fp32";
+        else if (logits_dtype == torch::kBFloat16) dtype_name = "bf16";
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+            "DG_SM120_MQA_LOGITS_V2_STRICT=1: MMA path could not handle this "
+            "shape: seq_len=%d seq_len_kv=%d num_heads=%d head_dim=%d "
+            "dtype=%s. Supported window: head_dim==64, num_heads<=64, dtype "
+            "in {fp32, bf16}. Either widen the MMA kernel's supported shapes "
+            "to include this shape, or unset STRICT to silently fall back to "
+            "the scalar inner.", seq_len, seq_len_kv, num_heads, head_dim,
+            dtype_name);
+        DG_HOST_UNREACHABLE(buf);
+    }
+    // Else fall through to scalar (silent fallback for unsupported shapes).
 
     const int out_cols = max_seqlen_k > 0 ? max_seqlen_k : seq_len_kv;
     const bool compressed_logits = max_seqlen_k > 0;
